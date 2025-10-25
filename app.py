@@ -13,6 +13,7 @@ from nba_api.stats.endpoints import (
     leaguedashteamstats,
     LeagueDashPlayerStats,
     commonplayerinfo,
+    leaguegamelog,
 )
 
 # ----------------------- Streamlit Setup -----------------------
@@ -67,8 +68,9 @@ def form_score(series: pd.Series, k: int = 5) -> float:
 
 def opponent_adjustment(def_rating: float, pace_val: float,
                         league_def: float, league_pace_mean: float) -> float:
-    def_factor  = league_def / max(def_rating, 1e-9)      # lower DEF_RATING => tougher => def_factor > 1
-    pace_factor = pace_val / max(league_pace_mean, 1e-9)  # faster pace => more possessions
+    # lower DEF_RATING => tougher => def_factor > 1 (scales down projection)
+    def_factor  = league_def / max(def_rating, 1e-9)
+    pace_factor = pace_val / max(league_pace_mean, 1e-9)
     return float(def_factor * pace_factor)
 
 def window_avg(df: pd.DataFrame, n: int, cols) -> pd.Series:
@@ -100,13 +102,12 @@ def career_pg_counting_stat(career_df: pd.DataFrame, col: str) -> float:
         return np.nan
     return float(s_tot[mask].sum() / s_gp[mask].sum())
 
-# ---------- helpers for rendering & ordinal ranks ----------
+# ---------- Render helpers & ordinal ----------
 def _auto_height(df: pd.DataFrame, row_px: int = 34, header_px: int = 38, max_px: int = 900) -> int:
     rows = max(len(df), 1)
     return min(max_px, header_px + row_px * rows + 8)
 
 def render_summary_table(df_indexed: pd.DataFrame):
-    """Format to 2 decimals and render with a height that avoids vertical scrolling."""
     styler = df_indexed.style.format("{:.2f}")
     h = _auto_height(df_indexed)
     st.dataframe(styler, use_container_width=True, height=h)
@@ -144,20 +145,53 @@ def get_all_players_df():
 def get_teams_static_df():
     return pd.DataFrame(static_teams.get_teams())
 
+# ---- robust regular-season start detection to avoid preseason bleed ----
+@st.cache_data(ttl=CACHE_HOURS*3600)
+def _regular_season_start_date(season: str) -> str:
+    """
+    Find first Regular Season game date (YYYY-MM-DD) via team game logs.
+    Prevents preseason spill into team dashboards.
+    """
+    try:
+        df = leaguegamelog.LeagueGameLog(
+            season=season,
+            season_type_all_star="Regular Season",
+            player_or_team_abbreviation="T",
+        ).get_data_frames()[0]
+    except Exception:
+        df = pd.DataFrame()
+
+    if df.empty or "GAME_DATE" not in df.columns:
+        return f"{season.split('-')[0]}-10-01"
+
+    try:
+        gdates = pd.to_datetime(df["GAME_DATE"], format="mixed", errors="coerce")
+    except TypeError:
+        gdates = pd.to_datetime(df["GAME_DATE"], infer_datetime_format=True, errors="coerce")
+
+    first = gdates.min()
+    if pd.isna(first):
+        return f"{season.split('-')[0]}-10-01"
+    return first.strftime("%Y-%m-%d")
+
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_team_tables(season: str):
     """
-    Source of truth for opponent context:
-      - Advanced team table: PACE, DEF_RATING (Regular Season only)
-      - Opponent team table: OPP_PTS (as PTS_ALLOWED)
-      - Base table: OREB (for rebound adjustments)
+    Authoritative opponent context restricted to Regular Season only
+    by applying date_from = first RS game.
+    Advanced: PACE, DEF_RATING, DREB_PCT
+    Opponent: OPP_PTS -> PTS_ALLOWED
+    Base: OREB
     """
-    # Advanced (PACE, DEF_RATING)
+    date_from = _regular_season_start_date(season)
+
+    # Advanced (PACE, DEF_RATING, DREB_PCT)
     df_adv_all = leaguedashteamstats.LeagueDashTeamStats(
         season=season,
         per_mode_detailed="PerGame",
         measure_type_detailed_defense="Advanced",
         season_type_all_star="Regular Season",
+        date_from_nullable=date_from,
     ).get_data_frames()[0]
 
     # Opponent (Points Allowed)
@@ -166,17 +200,19 @@ def get_team_tables(season: str):
         per_mode_detailed="PerGame",
         measure_type_detailed_defense="Opponent",
         season_type_all_star="Regular Season",
+        date_from_nullable=date_from,
     ).get_data_frames()[0]
 
-    # Base (OREB for rebounding context)
+    # Base (OREB for rebound adjustments)
     df_base_all = leaguedashteamstats.LeagueDashTeamStats(
         season=season,
         per_mode_detailed="PerGame",
         measure_type_detailed_defense="Base",
         season_type_all_star="Regular Season",
+        date_from_nullable=date_from,
     ).get_data_frames()[0]
 
-    # Keep NBA teams only
+    # NBA teams only
     df_adv  = df_adv_all[df_adv_all["TEAM_ID"].apply(is_nba_team_id)].copy()
     df_opp  = df_opp_all[df_opp_all["TEAM_ID"].apply(is_nba_team_id)].copy()
     df_base = df_base_all[df_base_all["TEAM_ID"].apply(is_nba_team_id)].copy()
@@ -199,14 +235,14 @@ def get_team_tables(season: str):
     )
 
     # League means for adjustments
-    league_pace_mean = float(df_adv["PACE"].mean())
-    league_dreb_pct_mean = float(df_adv["DREB_PCT"].mean()) if "DREB_PCT" in df_adv.columns else np.nan
-    league_oreb_mean = float(df_base["OREB"].mean())
+    league_pace_mean = float(pd.to_numeric(teams_ctx["PACE"], errors="coerce").mean())
+    league_dreb_pct_mean = float(pd.to_numeric(teams_ctx["DREB_PCT"], errors="coerce").mean()) if "DREB_PCT" in teams_ctx.columns else np.nan
+    league_oreb_mean = float(pd.to_numeric(teams_ctx["OREB"], errors="coerce").mean())
 
-    # Ranks: DEF & PTS_ALLOWED asc (lower is better), PACE desc (faster is better)
-    teams_ctx["RANK_DEF"]  = teams_ctx["DEF_RATING"].rank(method="min", ascending=True).astype(int)
-    teams_ctx["RANK_PA"]   = teams_ctx["PTS_ALLOWED"].rank(method="min", ascending=True).astype(int)
-    teams_ctx["RANK_PACE"] = teams_ctx["PACE"].rank(method="min", ascending=False).astype(int)
+    # Ranks: DEF & PTS_ALLOWED asc (lower is better), PACE desc (higher is better)
+    teams_ctx["RANK_DEF"]  = pd.to_numeric(teams_ctx["DEF_RATING"], errors="coerce").rank(method="min", ascending=True).astype(int)
+    teams_ctx["RANK_PA"]   = pd.to_numeric(teams_ctx["PTS_ALLOWED"], errors="coerce").rank(method="min", ascending=True).astype(int)
+    teams_ctx["RANK_PACE"] = pd.to_numeric(teams_ctx["PACE"], errors="coerce").rank(method="min", ascending=False).astype(int)
 
     return teams_ctx, league_pace_mean, league_dreb_pct_mean, league_oreb_mean
 
@@ -325,7 +361,7 @@ with st.sidebar:
     teams_ctx, league_pace_mean, league_dreb_pct_mean, league_oreb_mean = get_team_tables(season)
     opponent = st.selectbox("Opponent", teams_ctx["TEAM_NAME"].tolist())
 
-    # ---- Window now includes "Season"
+    # Window now includes "Season"
     n_recent_choice = st.radio("Recent window", ["Season", 5, 10, 15, 20, 25], horizontal=True, index=1)
     n_recent = n_recent_choice if isinstance(n_recent_choice, int) else None
 
@@ -364,7 +400,6 @@ opp_def       = float(opp_row["DEF_RATING"])
 opp_pace      = float(opp_row["PACE"])
 opp_pts_allow = float(opp_row["PTS_ALLOWED"]) if "PTS_ALLOWED" in opp_row.index and pd.notna(opp_row["PTS_ALLOWED"]) else np.nan
 
-# ranks (precomputed in teams_ctx)
 rank_def  = int(opp_row.get("RANK_DEF",  np.nan)) if pd.notna(opp_row.get("RANK_DEF",  np.nan)) else None
 rank_pace = int(opp_row.get("RANK_PACE", np.nan)) if pd.notna(opp_row.get("RANK_PACE", np.nan)) else None
 rank_pa   = int(opp_row.get("RANK_PA",   np.nan)) if pd.notna(opp_row.get("RANK_PA",   np.nan)) else None
@@ -414,7 +449,7 @@ with right:
         border:1px solid #e6e6e6; border-radius:12px; padding:10px 12px;
         box-sizing:border-box; text-align:center;
       }
-      .statcard .title { font-weight:600; font-size:0.95rem; margin-bottom:4px; }
+      .statcard .title { font-weight:600; font-size:0.95rem; margin-bottom:4px; text-align:center; }
       .statcard .value { display:flex; align-items:baseline; justify-content:center; gap:6px; flex-wrap:wrap; }
       .statcard .value .num { font-size:1.25rem; line-height:1.6rem; }
       .statcard .value .rank { font-size:0.95rem; font-style:italic; opacity:0.85; }
@@ -483,7 +518,7 @@ FG3A_per_min_season = pm_ratio(logs["FG3A"], logs["MIN"])
 FTA_per_min_season  = pm_ratio(logs["FTA"],  logs["MIN"])
 
 FG2A_career_pg = safe_div((career_pg_counting_stat(career_raw, "FGA") - career_pg_counting_stat(career_raw, "FG3A")), 1.0)
-FG3A_career_pg = career_pg_counting_stat(career_raw, "FG3A")
+FG3A_career_pg = career_pg_counting_stat(career_raw, "FG3M") if "FG3M" in career_raw.columns else career_pg_counting_stat(career_raw, "FG3A")
 FTA_career_pg  = career_pg_counting_stat(career_raw, "FTA")
 
 FG2A_per_min_career = safe_div(FG2A_career_pg, MIN_career_pg)
@@ -624,7 +659,7 @@ out = out.round(2)
 summary_indexed = out.set_index("Stat")
 render_summary_table(summary_indexed)
 
-# ----------------------- Compare Windows (career fixed per-game) -----------------------
+# ----------------------- Compare Windows (Career vs Season vs L5/L10/L20) -----------------------
 st.markdown("### Compare Windows (Career vs Season vs L5/L10/L20)")
 kpi_existing = [c for c in ["PTS","REB","AST","MIN","FG3M"] if c in logs.columns]
 L5  = window_avg(logs, 5,  kpi_existing)
@@ -719,9 +754,9 @@ else:
     )
 
 st.caption(
-    "Notes: Opponent context now pulls DEF Rating & Pace from Advanced team stats, and Points Allowed from Opponent team stats — all Regular Season only. "
-    "Tables are formatted to two decimals and auto-sized to avoid vertical scrolling. "
-    "Career values use proper per-game aggregation from season totals (sum totals / sum GP). "
-    "If current-season logs are not yet available for a player, the app falls back to the most recent season with data. "
-    "Rookies are restricted to their available season. Trend lines follow the selected window (or Season)."
+    "Notes: Opponent context pulls DEF Rating & Pace from Advanced team stats, and Points Allowed from Opponent team stats — "
+    "all Regular Season only and restricted to post–regular-season start date to avoid preseason bleed. Tables auto-size with "
+    "two-decimal formatting. Career values use per-game from season totals (sum totals / sum GP). If current-season logs are not "
+    "available, the app falls back to the most recent season with data. Rookies are limited to their available season. Trend lines "
+    "follow the selected window (or Season)."
 )
