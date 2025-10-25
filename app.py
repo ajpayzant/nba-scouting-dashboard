@@ -136,8 +136,9 @@ def detect_available_seasons(max_back_years: int = 12) -> list[str]:
     return available
 
 @st.cache_data(ttl=CACHE_HOURS*3600)
-def get_active_players_df():
-    return pd.DataFrame(static_players.get_active_players())
+def get_all_players_df():
+    """All NBA players (active + inactive). Prospects not yet in NBA DB won't be present."""
+    return pd.DataFrame(static_players.get_players())
 
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_teams_static_df():
@@ -276,7 +277,11 @@ def last_n_vs_opponent(player_id: int, opp_abbr: str, seasons_list: list[str], n
     return all_df
 
 # ----------------------- Sidebar Controls -----------------------
-players_df = get_active_players_df().sort_values("full_name")
+players_df = get_all_players_df()
+# Keep only columns we actually use, clean names, and sort
+players_df = players_df[["id","full_name","is_active"]].copy()
+players_df = players_df.sort_values("full_name").reset_index(drop=True)
+
 teams_static_df = get_teams_static_df()
 
 SEASONS = detect_available_seasons(max_back_years=12)
@@ -289,9 +294,12 @@ with st.sidebar:
     q = st.text_input("Search player", value="Jayson Tatum")
     filtered = players_df[players_df["full_name"].str.contains(q, case=False, na=False)]
     if filtered.empty:
+        st.info("No matching NBA players found. If you're searching a prospect (e.g., Cooper Flagg), they may not be in the NBA database yet.")
         st.stop()
     player_name = st.selectbox("Player", filtered["full_name"].tolist())
-    player_id = int(filtered.loc[filtered["full_name"] == player_name, "id"].iloc[0])
+    player_row = filtered.loc[filtered["full_name"] == player_name].iloc[0]
+    player_id = int(player_row["id"])
+    is_active = bool(player_row.get("is_active", False))
 
     teams_ctx, league_pace_mean, league_dreb_pct_mean, league_oreb_mean = get_team_tables(season)
     opponent = st.selectbox("Opponent", teams_ctx["TEAM_NAME"].tolist())
@@ -301,17 +309,26 @@ with st.sidebar:
     w_season = st.slider("Weight: Season", 0.0, 1.0, 0.30, 0.05)
     w_career = st.slider("Weight: Career", 0.0, 1.0, 0.15, 0.05)
 
-# ----------------------- Data fetch & Rookie handling -----------------------
+# ----------------------- Data fetch & Rookie/Prospect handling -----------------------
 cpi = get_common_player_info(player_id)
 rookie = is_rookie_by_cpi(cpi)
+
+# If the player truly isn't in NBA DB (prospect), CommonPlayerInfo will usually be empty and logs will be impossible.
+if cpi.empty and not is_active:
+    st.error(
+        f"**{player_name}** is not yet in the NBA stats database. "
+        "Prospects (e.g., Cooper Flagg, Dylan Harper, V.J. Edgecombe, Hugo Gonzalez) "
+        "become available once the NBA adds them to the official database."
+    )
+    st.stop()
 
 season_used = best_season_for_player(player_id, season, SEASONS)
 if rookie and season_used != season:
     st.warning(f"{player_name} appears to be a rookie. Showing the only season with available logs: **{season_used}**.")
 logs = get_player_logs(player_id, season_used)
 if logs.empty:
-    if rookie:
-        st.error("No game logs available yet for this rookie.")
+    if rookie or not is_active:
+        st.error("No NBA game logs available yet for this player.")
     else:
         st.error("No game logs found for this player/season.")
     st.stop()
@@ -365,10 +382,11 @@ with left:
 with right:
     st.markdown(f"**Opponent: {opponent}**")
     c1, c2, c3 = st.columns(3)
-    c1.metric("DEF Rating", f"{opp_def:.1f} ({ordinal(rank_def)})")
-    c2.metric("Pace (proxy)", f"{opp_pace:.1f} ({ordinal(rank_pace)})")
+    # rank in label; pure number in value (prevents truncation/ellipsis)
+    c1.metric(f"DEF Rating ({ordinal(rank_def)})", f"{opp_def:.1f}")
+    c2.metric(f"Pace (proxy) ({ordinal(rank_pace)})", f"{opp_pace:.1f}")
     if np.isfinite(opp_pts_allow):
-        c3.metric("Points Allowed", f"{opp_pts_allow:.1f} ({ordinal(rank_pa)})")
+        c3.metric(f"Points Allowed ({ordinal(rank_pa)})", f"{opp_pts_allow:.1f}")
     else:
         c3.metric("Points Allowed", "—")
 
@@ -628,5 +646,6 @@ st.caption(
     "Notes: Tables are formatted to two decimals and auto-sized to avoid vertical scrolling. "
     "Career values use proper per-game aggregation from season totals (sum totals / sum GP). "
     "If current-season logs are not yet available for a player, the app falls back to the most recent season with data. "
-    "Rookies are restricted to their available season. Opponent header shows DEF Rating, Pace (proxy), and Points Allowed with league rank."
+    "Rookies are restricted to their available season. Opponent header shows DEF Rating, Pace (proxy), and Points Allowed with league rank. "
+    "Prospects not yet in the NBA database will appear unavailable until the NBA publishes their IDs."
 )
