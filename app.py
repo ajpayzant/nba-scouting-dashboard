@@ -278,7 +278,6 @@ def last_n_vs_opponent(player_id: int, opp_abbr: str, seasons_list: list[str], n
 
 # ----------------------- Sidebar Controls -----------------------
 players_df = get_all_players_df()
-# Keep only columns we actually use, clean names, and sort
 players_df = players_df[["id","full_name","is_active"]].copy()
 players_df = players_df.sort_values("full_name").reset_index(drop=True)
 
@@ -313,7 +312,6 @@ with st.sidebar:
 cpi = get_common_player_info(player_id)
 rookie = is_rookie_by_cpi(cpi)
 
-# If the player truly isn't in NBA DB (prospect), CommonPlayerInfo will usually be empty and logs will be impossible.
 if cpi.empty and not is_active:
     st.error(
         f"**{player_name}** is not yet in the NBA stats database. "
@@ -354,7 +352,7 @@ ORB_adj = (league_dreb_pct_mean / opp_dreb_pct) if np.isfinite(league_dreb_pct_m
 DRB_adj = (league_oreb_mean / opp_oreb)       if np.isfinite(league_oreb_mean)     and np.isfinite(opp_oreb)     and opp_oreb > 0         else 1.0
 
 # ----------------------- Player header (Age • Position • Seasons • GP) -----------------------
-left, right = st.columns([2, 1])
+left, right = st.columns([2, 1.4])  # give the right pane a bit more width for readability
 with left:
     st.subheader(f"{player_name} — {season_used}")
     age = pos = exp = None
@@ -381,14 +379,32 @@ with left:
 
 with right:
     st.markdown(f"**Opponent: {opponent}**")
-    c1, c2, c3 = st.columns(3)
-    # rank in label; pure number in value (prevents truncation/ellipsis)
-    c1.metric(f"DEF Rating ({ordinal(rank_def)})", f"{opp_def:.1f}")
-    c2.metric(f"Pace (proxy) ({ordinal(rank_pace)})", f"{opp_pace:.1f}")
-    if np.isfinite(opp_pts_allow):
-        c3.metric(f"Points Allowed ({ordinal(rank_pa)})", f"{opp_pts_allow:.1f}")
-    else:
-        c3.metric("Points Allowed", "—")
+
+    def stat_card(title: str, value, rank):
+        # Build line with value + rank (if available)
+        if value is None or (isinstance(value, float) and not np.isfinite(value)):
+            val_line = "—"
+        else:
+            rank_text = f" ({ordinal(rank)})" if rank else ""
+            val_line = f"{value:.1f}{rank_text}"
+        st.markdown(
+            f"""
+            <div style="padding:10px 12px;border:1px solid #e6e6e6;border-radius:10px;margin-bottom:8px;">
+                <div style="font-weight:600;font-size:0.95rem;margin-bottom:4px;">{title}</div>
+                <div style="font-size:1.25rem;line-height:1.6rem;white-space:nowrap;">{val_line}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    # Use two columns on wide screens to ensure ample width; falls back nicely on narrow screens
+    cc1, cc2, cc3 = st.columns([1,1,1])
+    with cc1:
+        stat_card("DEF Rating", opp_def, rank_def)
+    with cc2:
+        stat_card("Points Allowed", opp_pts_allow, rank_pa)
+    with cc3:
+        stat_card("Pace", opp_pace, rank_pace)
 
 # ----------------------- Baselines & blends -----------------------
 def mean_recent(series, n=n_recent):
