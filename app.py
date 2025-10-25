@@ -146,45 +146,67 @@ def get_teams_static_df():
 
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_team_tables(season: str):
-    # Defense & Base (for pace proxy inputs)
-    df_def_all = leaguedashteamstats.LeagueDashTeamStats(
-        season=season, per_mode_detailed="PerGame", measure_type_detailed_defense="Defense"
+    """
+    Source of truth for opponent context:
+      - Advanced team table: PACE, DEF_RATING (Regular Season only)
+      - Opponent team table: OPP_PTS (as PTS_ALLOWED)
+      - Base table: OREB (for rebound adjustments)
+    """
+    # Advanced (PACE, DEF_RATING)
+    df_adv_all = leaguedashteamstats.LeagueDashTeamStats(
+        season=season,
+        per_mode_detailed="PerGame",
+        measure_type_detailed_defense="Advanced",
+        season_type_all_star="Regular Season",
     ).get_data_frames()[0]
-    df_base_all = leaguedashteamstats.LeagueDashTeamStats(
-        season=season, per_mode_detailed="PerGame"
-    ).get_data_frames()[0]
-    # Opponent (for Points Allowed)
+
+    # Opponent (Points Allowed)
     df_opp_all = leaguedashteamstats.LeagueDashTeamStats(
-        season=season, per_mode_detailed="PerGame", measure_type_detailed_defense="Opponent"
+        season=season,
+        per_mode_detailed="PerGame",
+        measure_type_detailed_defense="Opponent",
+        season_type_all_star="Regular Season",
     ).get_data_frames()[0]
 
-    df_def  = df_def_all[df_def_all["TEAM_ID"].apply(is_nba_team_id)].copy()
-    df_base = df_base_all[df_base_all["TEAM_ID"].apply(is_nba_team_id)].copy()
+    # Base (OREB for rebounding context)
+    df_base_all = leaguedashteamstats.LeagueDashTeamStats(
+        season=season,
+        per_mode_detailed="PerGame",
+        measure_type_detailed_defense="Base",
+        season_type_all_star="Regular Season",
+    ).get_data_frames()[0]
+
+    # Keep NBA teams only
+    df_adv  = df_adv_all[df_adv_all["TEAM_ID"].apply(is_nba_team_id)].copy()
     df_opp  = df_opp_all[df_opp_all["TEAM_ID"].apply(is_nba_team_id)].copy()
+    df_base = df_base_all[df_base_all["TEAM_ID"].apply(is_nba_team_id)].copy()
 
-    keep_def  = ["TEAM_ID","TEAM_NAME","DEF_RATING","DREB_PCT"]
-    keep_base = ["TEAM_ID","TEAM_NAME","MIN","FGA","FTA","OREB","TOV"]
-    keep_opp  = ["TEAM_ID","OPP_PTS"]
-    df_def  = df_def[keep_def].copy()
-    df_base = df_base[keep_base].copy()
-    df_opp  = df_opp[keep_opp].rename(columns={"OPP_PTS":"PTS_ALLOWED"}).copy()
+    # Select / rename columns
+    keep_adv = ["TEAM_ID","TEAM_NAME","PACE","DEF_RATING","DREB_PCT"]
+    keep_opp = ["TEAM_ID","OPP_PTS"]
+    keep_bas = ["TEAM_ID","OREB"]
 
-    df_base["PACE_PROXY"] = df_base.apply(pace_proxy_row, axis=1)
-    league_pace_mean = float(df_base["PACE_PROXY"].mean())
-    league_dreb_pct_mean = float(df_def["DREB_PCT"].mean()) if "DREB_PCT" in df_def.columns else np.nan
-    league_oreb_mean = float(df_base["OREB"].mean())
+    df_adv = df_adv[keep_adv].copy()
+    df_opp = df_opp[keep_opp].rename(columns={"OPP_PTS":"PTS_ALLOWED"}).copy()
+    df_base = df_base[keep_bas].copy()
 
+    # Merge
     teams_ctx = (
-        df_def.merge(df_base[["TEAM_ID","PACE_PROXY","OREB"]], on="TEAM_ID", how="left")
-              .merge(df_opp[["TEAM_ID","PTS_ALLOWED"]], on="TEAM_ID", how="left")
+        df_adv.merge(df_opp, on="TEAM_ID", how="left")
+              .merge(df_base, on="TEAM_ID", how="left")
               .sort_values("TEAM_NAME")
               .reset_index(drop=True)
     )
 
-    # League ranks: DEF & Points Allowed => ascending (lower is better); Pace => descending (higher is better)
+    # League means for adjustments
+    league_pace_mean = float(df_adv["PACE"].mean())
+    league_dreb_pct_mean = float(df_adv["DREB_PCT"].mean()) if "DREB_PCT" in df_adv.columns else np.nan
+    league_oreb_mean = float(df_base["OREB"].mean())
+
+    # Ranks: DEF & PTS_ALLOWED asc (lower is better), PACE desc (faster is better)
     teams_ctx["RANK_DEF"]  = teams_ctx["DEF_RATING"].rank(method="min", ascending=True).astype(int)
-    teams_ctx["RANK_PACE"] = teams_ctx["PACE_PROXY"].rank(method="min", ascending=False).astype(int)
     teams_ctx["RANK_PA"]   = teams_ctx["PTS_ALLOWED"].rank(method="min", ascending=True).astype(int)
+    teams_ctx["RANK_PACE"] = teams_ctx["PACE"].rank(method="min", ascending=False).astype(int)
 
     return teams_ctx, league_pace_mean, league_dreb_pct_mean, league_oreb_mean
 
@@ -339,7 +361,7 @@ career_raw = get_player_career(player_id)
 # ----------------------- Opponent Context -----------------------
 opp_row = teams_ctx.loc[teams_ctx["TEAM_NAME"] == opponent].iloc[0]
 opp_def       = float(opp_row["DEF_RATING"])
-opp_pace      = float(opp_row["PACE_PROXY"])
+opp_pace      = float(opp_row["PACE"])
 opp_pts_allow = float(opp_row["PTS_ALLOWED"]) if "PTS_ALLOWED" in opp_row.index and pd.notna(opp_row["PTS_ALLOWED"]) else np.nan
 
 # ranks (precomputed in teams_ctx)
@@ -390,27 +412,28 @@ with right:
       @media (max-width: 1100px) { .statgrid {grid-template-columns: 1fr;} }
       .statcard {
         border:1px solid #e6e6e6; border-radius:12px; padding:10px 12px;
-        box-sizing:border-box; text-align:center; overflow:hidden;
+        box-sizing:border-box; text-align:center;
       }
       .statcard .title { font-weight:600; font-size:0.95rem; margin-bottom:4px; }
-      .statcard .value { font-size:1.25rem; line-height:1.6rem; }
-      .statcard .rank { font-size:0.95rem; font-style:italic; opacity:0.85; margin-left:4px; }
+      .statcard .value { display:flex; align-items:baseline; justify-content:center; gap:6px; flex-wrap:wrap; }
+      .statcard .value .num { font-size:1.25rem; line-height:1.6rem; }
+      .statcard .value .rank { font-size:0.95rem; font-style:italic; opacity:0.85; }
     </style>
     """
     st.markdown(CARD_CSS, unsafe_allow_html=True)
 
     def stat_card(title: str, value, rank):
         if value is None or (isinstance(value, float) and not np.isfinite(value)):
-            val_html = "—"
+            num_html = "—"
             rank_html = ""
         else:
-            val_html = f"{value:.1f}"
+            num_html = f"{value:.1f}"
             rank_html = f"<span class='rank'>({ordinal(rank)})</span>" if rank else ""
         st.markdown(
             f"""
             <div class="statcard">
               <div class="title">{title}</div>
-              <div class="value">{val_html}{rank_html}</div>
+              <div class="value"><span class="num">{num_html}</span>{rank_html}</div>
             </div>
             """,
             unsafe_allow_html=True
@@ -696,9 +719,9 @@ else:
     )
 
 st.caption(
-    "Notes: Tables are formatted to two decimals and auto-sized to avoid vertical scrolling. "
+    "Notes: Opponent context now pulls DEF Rating & Pace from Advanced team stats, and Points Allowed from Opponent team stats — all Regular Season only. "
+    "Tables are formatted to two decimals and auto-sized to avoid vertical scrolling. "
     "Career values use proper per-game aggregation from season totals (sum totals / sum GP). "
     "If current-season logs are not yet available for a player, the app falls back to the most recent season with data. "
-    "Rookies are restricted to their available season. Opponent header shows DEF Rating, Pace, and Points Allowed with league rank. "
-    "Prospects not yet in the NBA database will appear unavailable until the NBA publishes their IDs."
+    "Rookies are restricted to their available season. Trend lines follow the selected window (or Season)."
 )
