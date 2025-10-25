@@ -100,31 +100,23 @@ def career_pg_counting_stat(career_df: pd.DataFrame, col: str) -> float:
         return np.nan
     return float(s_tot[mask].sum() / s_gp[mask].sum())
 
-# ---------- NEW: tiny helpers to render dataframes neatly ----------
+# ---------- helpers for rendering & ordinal ranks ----------
 def _auto_height(df: pd.DataFrame, row_px: int = 34, header_px: int = 38, max_px: int = 900) -> int:
-    """Compute a height that fits all rows to avoid vertical scroll in st.dataframe."""
     rows = max(len(df), 1)
     return min(max_px, header_px + row_px * rows + 8)
 
-def render_summary_table(df_indexed: pd.DataFrame, highlight_rows=None):
-    """
-    Format to 2 decimals, highlight full rows (e.g., PRA, 3PM), and render with
-    a height that avoids vertical scrolling.
-    """
-    if highlight_rows is None:
-        highlight_rows = set()
-    # two-decimal formatting everywhere
+def render_summary_table(df_indexed: pd.DataFrame):
+    """Format to 2 decimals and render with a height that avoids vertical scrolling."""
     styler = df_indexed.style.format("{:.2f}")
-
-    # full-row emphasis for selected rows
-    def _row_style(row):
-        if row.name in highlight_rows:
-            return ["font-weight: 700; background-color: #fff3cd;"] * len(row)
-        return [""] * len(row)
-
-    styler = styler.apply(_row_style, axis=1)
     h = _auto_height(df_indexed)
     st.dataframe(styler, use_container_width=True, height=h)
+
+def ordinal(n: int) -> str:
+    try:
+        n = int(n)
+    except Exception:
+        return "—"
+    return "%d%s" % (n, "tsnrhtdd"[(n//10%10!=1)*(n%10<4)*n%10::4])
 
 # ----------------------- Season detection & caching -----------------------
 @st.cache_data(ttl=6*3600)
@@ -153,20 +145,28 @@ def get_teams_static_df():
 
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_team_tables(season: str):
+    # Defense & Base (for pace proxy inputs)
     df_def_all = leaguedashteamstats.LeagueDashTeamStats(
         season=season, per_mode_detailed="PerGame", measure_type_detailed_defense="Defense"
     ).get_data_frames()[0]
     df_base_all = leaguedashteamstats.LeagueDashTeamStats(
         season=season, per_mode_detailed="PerGame"
     ).get_data_frames()[0]
+    # Opponent (for Points Allowed)
+    df_opp_all = leaguedashteamstats.LeagueDashTeamStats(
+        season=season, per_mode_detailed="PerGame", measure_type_detailed_defense="Opponent"
+    ).get_data_frames()[0]
 
     df_def  = df_def_all[df_def_all["TEAM_ID"].apply(is_nba_team_id)].copy()
     df_base = df_base_all[df_base_all["TEAM_ID"].apply(is_nba_team_id)].copy()
+    df_opp  = df_opp_all[df_opp_all["TEAM_ID"].apply(is_nba_team_id)].copy()
 
     keep_def  = ["TEAM_ID","TEAM_NAME","DEF_RATING","DREB_PCT"]
     keep_base = ["TEAM_ID","TEAM_NAME","MIN","FGA","FTA","OREB","TOV"]
+    keep_opp  = ["TEAM_ID","OPP_PTS"]
     df_def  = df_def[keep_def].copy()
     df_base = df_base[keep_base].copy()
+    df_opp  = df_opp[keep_opp].rename(columns={"OPP_PTS":"PTS_ALLOWED"}).copy()
 
     df_base["PACE_PROXY"] = df_base.apply(pace_proxy_row, axis=1)
     league_pace_mean = float(df_base["PACE_PROXY"].mean())
@@ -175,9 +175,16 @@ def get_team_tables(season: str):
 
     teams_ctx = (
         df_def.merge(df_base[["TEAM_ID","PACE_PROXY","OREB"]], on="TEAM_ID", how="left")
+              .merge(df_opp[["TEAM_ID","PTS_ALLOWED"]], on="TEAM_ID", how="left")
               .sort_values("TEAM_NAME")
               .reset_index(drop=True)
     )
+
+    # add league ranks
+    teams_ctx["RANK_DEF"]  = teams_ctx["DEF_RATING"].rank(method="min", ascending=True).astype(int)
+    teams_ctx["RANK_PACE"] = teams_ctx["PACE_PROXY"].rank(method="min", ascending=False).astype(int)
+    teams_ctx["RANK_PA"]   = teams_ctx["PTS_ALLOWED"].rank(method="min", ascending=True).astype(int)
+
     return teams_ctx, league_pace_mean, league_dreb_pct_mean, league_oreb_mean
 
 @st.cache_data(ttl=CACHE_HOURS*3600)
@@ -185,13 +192,19 @@ def get_player_logs(player_id: int, season: str):
     df = playergamelog.PlayerGameLog(player_id=player_id, season=season).get_data_frames()[0]
     if df.empty:
         return df
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    # Robust mixed-format parsing
+    try:
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], format="mixed", errors="coerce")
+    except TypeError:
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], infer_datetime_format=True, errors="coerce")
     df = df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
     # derive 2P components
-    df["FG2M"] = pd.to_numeric(df.get("FGM", 0), errors="coerce") - pd.to_numeric(df.get("FG3M", 0), errors="coerce")
-    df["FG2A"] = pd.to_numeric(df.get("FGA", 0), errors="coerce") - pd.to_numeric(df.get("FG3A", 0), errors="coerce")
-    df["FG2M"] = df["FG2M"].clip(lower=0)
-    df["FG2A"] = df["FG2A"].clip(lower=0)
+    df["FG3M"] = pd.to_numeric(df.get("FG3M", 0), errors="coerce")
+    df["FG3A"] = pd.to_numeric(df.get("FG3A", 0), errors="coerce")
+    df["FGM"]  = pd.to_numeric(df.get("FGM",  0), errors="coerce")
+    df["FGA"]  = pd.to_numeric(df.get("FGA",  0), errors="coerce")
+    df["FG2M"] = (df["FGM"] - df["FG3M"]).clip(lower=0)
+    df["FG2A"] = (df["FGA"] - df["FG3A"]).clip(lower=0)
     # ensure columns & derive PRA
     for col in ["PTS","REB","AST","FG3M","FG3A","OREB","DREB","MIN"]:
         if col not in df.columns:
@@ -210,6 +223,18 @@ def get_common_player_info(player_id: int):
     except Exception:
         return pd.DataFrame()
 
+def is_rookie_by_cpi(cpi_df: pd.DataFrame) -> bool:
+    try:
+        if cpi_df.empty:
+            return False
+        val = cpi_df.get("SEASON_EXP")
+        if val is None or len(val) == 0:
+            return False
+        exp = val.iloc[0]
+        return pd.to_numeric(exp, errors="coerce") == 0
+    except Exception:
+        return False
+
 def best_season_for_player(player_id: int, preferred: str, season_pool: list[str]) -> str:
     logs = get_player_logs(player_id, preferred)
     if not logs.empty:
@@ -223,11 +248,16 @@ def best_season_for_player(player_id: int, preferred: str, season_pool: list[str
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def last_n_vs_opponent(player_id: int, opp_abbr: str, seasons_list: list[str], n: int = 5) -> pd.DataFrame:
     frames = []
+    opp_abbr = (opp_abbr or "").upper()
     for s in seasons_list:
-        df = get_player_logs(player_id, s)
-        if df.empty:
+        try:
+            df = get_player_logs(player_id, s)
+        except Exception:
             continue
-        mask = df["MATCHUP"].str.contains(rf"\b{re.escape(opp_abbr)}\b", na=False, regex=True)
+        if df.empty or "MATCHUP" not in df.columns:
+            continue
+        matchup_upper = df["MATCHUP"].astype(str).str.upper()
+        mask = matchup_upper.str.contains(rf"\b{re.escape(opp_abbr)}\b", na=False, regex=True)
         part = df.loc[mask].copy()
         if not part.empty:
             part["SEASON"] = s
@@ -271,19 +301,34 @@ with st.sidebar:
     w_season = st.slider("Weight: Season", 0.0, 1.0, 0.30, 0.05)
     w_career = st.slider("Weight: Career", 0.0, 1.0, 0.15, 0.05)
 
-# ----------------------- Data fetch -----------------------
+# ----------------------- Data fetch & Rookie handling -----------------------
+cpi = get_common_player_info(player_id)
+rookie = is_rookie_by_cpi(cpi)
+
 season_used = best_season_for_player(player_id, season, SEASONS)
+if rookie and season_used != season:
+    st.warning(f"{player_name} appears to be a rookie. Showing the only season with available logs: **{season_used}**.")
 logs = get_player_logs(player_id, season_used)
 if logs.empty:
-    st.error("No game logs found for this player/season.")
+    if rookie:
+        st.error("No game logs available yet for this rookie.")
+    else:
+        st.error("No game logs found for this player/season.")
     st.stop()
+
 career_raw = get_player_career(player_id)
-cpi = get_common_player_info(player_id)
 
 # ----------------------- Opponent Context -----------------------
 opp_row = teams_ctx.loc[teams_ctx["TEAM_NAME"] == opponent].iloc[0]
-opp_def      = float(opp_row["DEF_RATING"])
-opp_pace     = float(opp_row["PACE_PROXY"])
+opp_def       = float(opp_row["DEF_RATING"])
+opp_pace      = float(opp_row["PACE_PROXY"])
+opp_pts_allow = float(opp_row["PTS_ALLOWED"]) if "PTS_ALLOWED" in opp_row.index and pd.notna(opp_row["PTS_ALLOWED"]) else np.nan
+
+# ranks (precomputed in teams_ctx)
+rank_def  = int(opp_row.get("RANK_DEF",  np.nan)) if pd.notna(opp_row.get("RANK_DEF",  np.nan)) else None
+rank_pace = int(opp_row.get("RANK_PACE", np.nan)) if pd.notna(opp_row.get("RANK_PACE", np.nan)) else None
+rank_pa   = int(opp_row.get("RANK_PA",   np.nan)) if pd.notna(opp_row.get("RANK_PA",   np.nan)) else None
+
 opp_dreb_pct = float(opp_row["DREB_PCT"]) if "DREB_PCT" in teams_ctx.columns else np.nan
 opp_oreb     = float(opp_row["OREB"])
 
@@ -297,25 +342,35 @@ with left:
     st.subheader(f"{player_name} — {season_used}")
     age = pos = exp = None
     if not cpi.empty:
-        age = cpi.get("AGE", pd.Series([None])).iloc[0] if "AGE" in cpi.columns else None
-        pos = cpi.get("POSITION", pd.Series([None])).iloc[0] if "POSITION" in cpi.columns else None
-        exp = cpi.get("SEASON_EXP", pd.Series([None])).iloc[0] if "SEASON_EXP" in cpi.columns else None
+        if "AGE" in cpi.columns and len(cpi["AGE"]) > 0:
+            age = cpi["AGE"].iloc[0]
+        if "POSITION" in cpi.columns and len(cpi["POSITION"]) > 0:
+            pos = cpi["POSITION"].iloc[0] or None
+        if "SEASON_EXP" in cpi.columns and len(cpi["SEASON_EXP"]) > 0:
+            exp = cpi["SEASON_EXP"].iloc[0]
     gp_this_season = int(len(logs))
     meta = []
     if age is not None and str(age) != "nan":
-        meta.append(f"Age: {int(float(age))}")
-    if pos:
-        meta.append(f"Position: {pos}")
+        try: meta.append(f"Age: {int(float(age))}")
+        except: pass
+    meta.append(f"Position: {pos if pos else '—'}")
     if exp is not None and str(exp) != "nan":
-        meta.append(f"Seasons: {int(float(exp))}")
+        try: meta.append(f"Seasons: {int(float(exp))}")
+        except: meta.append(f"Seasons: —")
+    else:
+        meta.append("Seasons: —")
     meta.append(f"GP ({season_used}): {gp_this_season}")
     st.caption(" • ".join(meta))
 
 with right:
     st.markdown(f"**Opponent: {opponent}**")
-    c1, c2 = st.columns(2)
-    c1.metric("DEF Rating", f"{opp_def:.1f}")
-    c2.metric("Pace (proxy)", f"{opp_pace:.1f}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("DEF Rating", f"{opp_def:.1f} ({ordinal(rank_def)})")
+    c2.metric("Pace (proxy)", f"{opp_pace:.1f} ({ordinal(rank_pace)})")
+    if np.isfinite(opp_pts_allow):
+        c3.metric("Points Allowed", f"{opp_pts_allow:.1f} ({ordinal(rank_pa)})")
+    else:
+        c3.metric("Points Allowed", "—")
 
 # ----------------------- Baselines & blends -----------------------
 def mean_recent(series, n=n_recent):
@@ -350,9 +405,10 @@ FTA_per_min_career  = safe_div(FTA_career_pg,  MIN_career_pg)
 def pct(series_m, series_a, n=None):
     m = pd.to_numeric(series_m, errors="coerce")
     a = pd.to_numeric(series_a, errors="coerce")
+    mask = (a > 0)
     if n is not None:
         m, a = m.head(n), a.head(n)
-    mask = a > 0
+        mask = (a > 0)
     return float((m[mask] / a[mask]).mean()) if mask.any() else np.nan
 
 FG2_PCT_recent = pct(logs["FG2M"], logs["FG2A"], n_recent)
@@ -465,7 +521,7 @@ pts_block = pd.DataFrame({
 }).round(2)
 st.dataframe(pts_block.style.format({"Value": "{:.2f}"}), use_container_width=True, height=_auto_height(pts_block))
 
-# ----------------------- Projection Summary (order + bold PRA & 3PM) -----------------------
+# ----------------------- Projection Summary (normal rows; no highlight) -----------------------
 st.markdown("### Projection Summary")
 out = pd.DataFrame({
     "Stat": ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"],
@@ -473,7 +529,7 @@ out = pd.DataFrame({
 })
 out = out.round(2)
 summary_indexed = out.set_index("Stat")
-render_summary_table(summary_indexed, highlight_rows={"PRA","3PM"})
+render_summary_table(summary_indexed)
 
 # ----------------------- Compare Windows (career fixed per-game) -----------------------
 st.markdown("### Compare Windows (Career vs Season vs L5/L10/L20)")
@@ -506,7 +562,6 @@ meta_cols = ["GAME_DATE","MATCHUP","WL"]
 recent_cols = [c for c in meta_cols + box_stat_order if c in logs.columns]
 
 last5 = logs.sort_values("GAME_DATE", ascending=False).head(5).copy()
-# ensure PRA present
 if "PRA" not in last5.columns:
     last5["PRA"] = last5.get("PTS",0) + last5.get("REB",0) + last5.get("AST",0)
 
@@ -514,7 +569,6 @@ display_last5 = last5[recent_cols].rename(columns={
     "FG2M":"2PM","FG2A":"2PA","FG3M":"3PM","FG3A":"3PA"
 })
 
-# format box-score stats as whole numbers (no decimals)
 int_cols = [c for c in ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in display_last5.columns]
 fmt_map = {c: "{:.0f}" for c in int_cols}
 
@@ -524,7 +578,6 @@ st.dataframe(
     height=_auto_height(display_last5)
 )
 
-# Averages row (keep two decimals since these aren’t single-game box scores)
 avg_cols = [c for c in ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in display_last5.columns]
 avg_last5 = display_last5[avg_cols].mean(numeric_only=True).to_frame().T.round(2)
 avg_last5.index = ["Average (Last 5)"]
@@ -539,6 +592,7 @@ st.markdown(f"### Last 5 vs {opponent} — Most Recent Seasons")
 ts = teams_static_df.rename(columns={"id":"TEAM_ID", "full_name":"TEAM_NAME", "abbreviation":"TEAM_ABBR"})
 match = ts.loc[ts["TEAM_NAME"].str.lower() == opponent.lower()]
 opp_abbr = match["TEAM_ABBR"].iloc[0] if not match.empty else opponent[:3].upper()
+opp_abbr = opp_abbr.upper()
 
 vs5 = last_n_vs_opponent(player_id, opp_abbr, SEASONS, n=5)
 if vs5.empty:
@@ -553,7 +607,6 @@ else:
     vs_cols = [c for c in meta_cols + stat_cols if c in vs5_display.columns]
     vs5_display = vs5_display.sort_values("GAME_DATE", ascending=False)[vs_cols]
 
-    # format single-game box stats as whole numbers
     int_cols_vs = [c for c in stat_cols if c in vs5_display.columns]
     fmt_map_vs = {c: "{:.0f}" for c in int_cols_vs}
 
@@ -563,7 +616,6 @@ else:
         height=_auto_height(vs5_display)
     )
 
-    # Averages row (keep two decimals)
     avg_vs = vs5_display[int_cols_vs].mean(numeric_only=True).to_frame().T.round(2)
     avg_vs.index = ["Average (vs Opp)"]
     st.dataframe(
@@ -572,4 +624,9 @@ else:
         height=_auto_height(avg_vs)
     )
 
-st.caption("Notes: Tables are formatted to two decimals and auto-sized to avoid vertical scrolling. PRA & 3PM are emphasized in the projection summary. Career values use proper per-game aggregation from season totals (sum totals / sum GP). If 2025-26 logs are not yet available for a player, the app falls back to the most recent season with data.")
+st.caption(
+    "Notes: Tables are formatted to two decimals and auto-sized to avoid vertical scrolling. "
+    "Career values use proper per-game aggregation from season totals (sum totals / sum GP). "
+    "If current-season logs are not yet available for a player, the app falls back to the most recent season with data. "
+    "Rookies are restricted to their available season. Opponent header shows DEF Rating, Pace (proxy), and Points Allowed with league rank."
+)
