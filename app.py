@@ -499,28 +499,42 @@ cmp_df = pd.concat(
 ).round(2)
 st.dataframe(cmp_df.style.format("{:.2f}"), use_container_width=True, height=_auto_height(cmp_df))
 
-# ----------------------- Last 5 Games — this season -----------------------
+# ----------------------- Last 5 Games — {season_used} -----------------------
 st.markdown(f"### Last 5 Games — {season_used}")
 box_stat_order = ["MIN","PTS","REB","AST","PRA","FG2M","FG2A","FG3M","FG3A","OREB","DREB"]
 meta_cols = ["GAME_DATE","MATCHUP","WL"]
 recent_cols = [c for c in meta_cols + box_stat_order if c in logs.columns]
+
 last5 = logs.sort_values("GAME_DATE", ascending=False).head(5).copy()
+# ensure PRA present
 if "PRA" not in last5.columns:
     last5["PRA"] = last5.get("PTS",0) + last5.get("REB",0) + last5.get("AST",0)
-display_last5 = last5[recent_cols].rename(columns={"FG2M":"2PM","FG2A":"2PA","FG3M":"3PM","FG3A":"3PA"})
-# numeric formatting for two decimals
-num_cols = [c for c in display_last5.columns if c not in ["GAME_DATE","MATCHUP","WL"]]
+
+display_last5 = last5[recent_cols].rename(columns={
+    "FG2M":"2PM","FG2A":"2PA","FG3M":"3PM","FG3A":"3PA"
+})
+
+# format box-score stats as whole numbers (no decimals)
+int_cols = [c for c in ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in display_last5.columns]
+fmt_map = {c: "{:.0f}" for c in int_cols}
+
 st.dataframe(
-    display_last5.style.format({c: "{:.2f}" for c in num_cols}),
+    display_last5.style.format(fmt_map),
     use_container_width=True,
     height=_auto_height(display_last5)
 )
+
+# Averages row (keep two decimals since these aren’t single-game box scores)
 avg_cols = [c for c in ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in display_last5.columns]
 avg_last5 = display_last5[avg_cols].mean(numeric_only=True).to_frame().T.round(2)
 avg_last5.index = ["Average (Last 5)"]
-st.dataframe(avg_last5.style.format("{:.2f}"), use_container_width=True, height=_auto_height(avg_last5))
+st.dataframe(
+    avg_last5.style.format("{:.2f}"),
+    use_container_width=True,
+    height=_auto_height(avg_last5)
+)
 
-# ----------------------- Last 5 vs Opponent — across seasons -----------------------
+# ----------------------- Last 5 vs {opponent} — Most Recent Seasons -----------------------
 st.markdown(f"### Last 5 vs {opponent} — Most Recent Seasons")
 ts = teams_static_df.rename(columns={"id":"TEAM_ID", "full_name":"TEAM_NAME", "abbreviation":"TEAM_ABBR"})
 match = ts.loc[ts["TEAM_NAME"].str.lower() == opponent.lower()]
@@ -533,17 +547,29 @@ else:
     if "PRA" not in vs5.columns:
         vs5["PRA"] = vs5.get("PTS",0) + vs5.get("REB",0) + vs5.get("AST",0)
     vs5_display = vs5.rename(columns={"FG2M":"2PM","FG2A":"2PA","FG3M":"3PM","FG3A":"3PA"}).copy()
-    vs_cols = [c for c in ["SEASON"] + meta_cols + ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in vs5_display.columns]
-    vs5_display = vs5_display.sort_values("GAME_DATE", ascending=False)
-    num_cols_vs = [c for c in vs_cols if c not in ["SEASON","GAME_DATE","MATCHUP","WL"]]
+
+    meta_cols = ["SEASON","GAME_DATE","MATCHUP","WL"]
+    stat_cols = ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"]
+    vs_cols = [c for c in meta_cols + stat_cols if c in vs5_display.columns]
+    vs5_display = vs5_display.sort_values("GAME_DATE", ascending=False)[vs_cols]
+
+    # format single-game box stats as whole numbers
+    int_cols_vs = [c for c in stat_cols if c in vs5_display.columns]
+    fmt_map_vs = {c: "{:.0f}" for c in int_cols_vs}
+
     st.dataframe(
-        vs5_display[vs_cols].style.format({c: "{:.2f}" for c in num_cols_vs}),
+        vs5_display.style.format(fmt_map_vs),
         use_container_width=True,
-        height=_auto_height(vs5_display[vs_cols])
+        height=_auto_height(vs5_display)
     )
-    avg_vs_cols = [c for c in ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in vs5_display.columns]
-    avg_vs = vs5_display[avg_vs_cols].mean(numeric_only=True).to_frame().T.round(2)
+
+    # Averages row (keep two decimals)
+    avg_vs = vs5_display[int_cols_vs].mean(numeric_only=True).to_frame().T.round(2)
     avg_vs.index = ["Average (vs Opp)"]
-    st.dataframe(avg_vs.style.format("{:.2f}"), use_container_width=True, height=_auto_height(avg_vs))
+    st.dataframe(
+        avg_vs.style.format("{:.2f}"),
+        use_container_width=True,
+        height=_auto_height(avg_vs)
+    )
 
 st.caption("Notes: Tables are formatted to two decimals and auto-sized to avoid vertical scrolling. PRA & 3PM are emphasized in the projection summary. Career values use proper per-game aggregation from season totals (sum totals / sum GP). If 2025-26 logs are not yet available for a player, the app falls back to the most recent season with data.")
