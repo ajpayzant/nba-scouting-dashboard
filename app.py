@@ -183,8 +183,8 @@ def get_player_logs(player_id: int, season: str):
     df["FG2A"] = pd.to_numeric(df.get("FGA", 0), errors="coerce") - pd.to_numeric(df.get("FG3A", 0), errors="coerce")
     df["FG2M"] = df["FG2M"].clip(lower=0)
     df["FG2A"] = df["FG2A"].clip(lower=0)
-    # Derived PRA for trend view
-    for col in ["PTS","REB","AST"]:
+    # Derived PRA and 3PA for trend/box
+    for col in ["PTS","REB","AST","FG3M","FG3A","OREB","DREB","MIN"]:
         if col not in df.columns:
             df[col] = np.nan
     df["PRA"] = df["PTS"] + df["REB"] + df["AST"]
@@ -237,6 +237,11 @@ def last_n_vs_opponent(player_id: int, opp_abbr: str, seasons_list: list[str], n
         return pd.DataFrame()
     all_df = pd.concat(frames, ignore_index=True)
     all_df = all_df.sort_values("GAME_DATE", ascending=False).head(n)
+    # ensure PRA exists
+    for col in ["PTS","REB","AST"]:
+        if col not in all_df.columns:
+            all_df[col] = np.nan
+    all_df["PRA"] = all_df["PTS"] + all_df["REB"] + all_df["AST"]
     return all_df
 
 # ----------------------- Sidebar Controls -----------------------
@@ -337,7 +342,6 @@ def blend_vals(r, s, c, wr=w_recent, ws=w_season, wc=w_career):
 # Minutes
 MIN_recent = mean_recent(logs["MIN"], n_recent)
 MIN_season = season_mean(logs["MIN"])
-# Career minutes per game via totals/GP
 MIN_career_pg = career_pg_counting_stat(career_raw, "MIN")
 MIN_proj = float(MIN_recent if np.isfinite(MIN_recent) else MIN_season)
 
@@ -350,7 +354,7 @@ FG2A_per_min_season = pm_ratio(logs["FG2A"], logs["MIN"])
 FG3A_per_min_season = pm_ratio(logs["FG3A"], logs["MIN"])
 FTA_per_min_season  = pm_ratio(logs["FTA"],  logs["MIN"])
 
-# Career attempts per minute from totals & minutes per game
+# Career attempts per minute from per-game (totals/GP) & minutes per game
 FG2A_career_pg = safe_div((career_pg_counting_stat(career_raw, "FGA") - career_pg_counting_stat(career_raw, "FG3A")), 1.0)
 FG3A_career_pg = career_pg_counting_stat(career_raw, "FG3A")
 FTA_career_pg  = career_pg_counting_stat(career_raw, "FTA")
@@ -359,7 +363,7 @@ FG2A_per_min_career = safe_div(FG2A_career_pg, MIN_career_pg)
 FG3A_per_min_career = safe_div(FG3A_career_pg, MIN_career_pg)
 FTA_per_min_career  = safe_div(FTA_career_pg,  MIN_career_pg)
 
-# Percentages (recent/season) from logs
+# Percentages (recent/season) from logs; career via totals
 def pct(series_m, series_a, n=None):
     m = pd.to_numeric(series_m, errors="coerce")
     a = pd.to_numeric(series_a, errors="coerce")
@@ -425,7 +429,6 @@ FG3_PCT_blend = blend_vals_local(FG3_PCT_recent, FG3_PCT_season, FG3_PCT_career)
 FT_PCT_blend  = blend_vals_local(FT_PCT_recent,  FT_PCT_season,  FT_PCT_career)
 
 # Attempts adjusted by (def x pace) and minutes
-MIN_proj = float(MIN_recent if np.isfinite(MIN_recent) else MIN_season)
 FG2A_proj = max(0.0, (FG2A_per_min_blend * MIN_proj) * AdjFactor) if np.isfinite(FG2A_per_min_blend) else 0.0
 FG3A_proj = max(0.0, (FG3A_per_min_blend * MIN_proj) * AdjFactor) if np.isfinite(FG3A_per_min_blend) else 0.0
 FTA_proj  = max(0.0, (FTA_per_min_blend  * MIN_proj) * AdjFactor) if np.isfinite(FTA_per_min_blend)  else 0.0
@@ -481,21 +484,26 @@ for s in trend_cols:
     )
     st.altair_chart(chart, use_container_width=True)
 
-# ----------------------- Points Component Model (Transparency) -----------------------
-st.markdown("### Points Component Model (Transparency)")
+# ----------------------- Points Component Model -----------------------
+st.markdown("### Points Component Model")
 pts_block = pd.DataFrame({
     "Component": ["2PA","2PM","2P%","3PA","3PM","3P%","FTA","FTM","FT%","PTS"],
     "Value": [FG2A_proj, FG2M_proj, FG2_PCT_blend, FG3A_proj, FG3M_proj, FG3_PCT_blend, FTA_proj, FTM_proj, FT_PCT_blend, PTS_proj]
 }).round(2)
 st.dataframe(pts_block, use_container_width=True)
 
-# ----------------------- Projection Summary (requested order) -----------------------
+# ----------------------- Projection Summary (requested order + bold PRA & 3PM) -----------------------
 st.markdown("### Projection Summary")
 out = pd.DataFrame({
-    "Stat": ["MIN","PTS","REB","AST","PRA","3PM","OREB","DREB"],
-    "Proj": [MIN_proj, PTS_proj, REB_proj, AST_proj, PRA_proj, FG3M_proj, ORB_proj, DRB_proj]
+    "Stat": ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"],
+    "Proj": [MIN_proj, PTS_proj, REB_proj, AST_proj, PRA_proj, FG2M_proj, FG2A_proj, FG3M_proj, FG3A_proj, ORB_proj, DRB_proj]
 }).round(2)
-st.dataframe(out.set_index("Stat"), use_container_width=True)
+
+styled_out = (
+    out.set_index("Stat")
+       .style.apply(lambda s: ['font-weight: bold' if s.name in ['PRA','3PM'] else '' for _ in s], axis=1)
+)
+st.dataframe(styled_out, use_container_width=True)
 
 # ----------------------- Compare Windows (career fixed per-game) -----------------------
 st.markdown("### Compare Windows (Career vs Season vs L5/L10/L20)")
@@ -524,14 +532,24 @@ st.dataframe(cmp_df, use_container_width=True)
 
 # ----------------------- Last 5 Games (this season_used) -----------------------
 st.markdown(f"### Last 5 Games — {season_used}")
-recent_cols = [c for c in [
-    "GAME_DATE","MATCHUP","WL","MIN","PTS","FG3M","REB","AST","OREB","DREB","FTA","FG2M","FG2A","FG3A"
-] if c in logs.columns]
-last5 = logs.sort_values("GAME_DATE", ascending=False).head(5)
-if last5.empty:
-    st.info(f"No games recorded for {player_name} in {season_used}.")
-else:
-    st.dataframe(last5[recent_cols], use_container_width=True)
+# Desired stat order for display after metadata
+box_stat_order = ["MIN","PTS","REB","AST","PRA","FG2M","FG2A","FG3M","FG3A","OREB","DREB"]
+meta_cols = ["GAME_DATE","MATCHUP","WL"]
+recent_cols = [c for c in meta_cols + box_stat_order if c in logs.columns]
+last5 = logs.sort_values("GAME_DATE", ascending=False).head(5).copy()
+# ensure PRA present (already in logs, but guard)
+if "PRA" not in last5.columns:
+    last5["PRA"] = last5.get("PTS",0) + last5.get("REB",0) + last5.get("AST",0)
+# Rename to your labels (2PM/2PA/3PM/3PA)
+display_last5 = last5[recent_cols].rename(columns={
+    "FG2M":"2PM","FG2A":"2PA","FG3M":"3PM","FG3A":"3PA"
+})
+st.dataframe(display_last5, use_container_width=True)
+# Averages row under the table
+avg_cols = [c for c in ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in display_last5.columns]
+avg_last5 = display_last5[avg_cols].mean(numeric_only=True).to_frame().T.round(2)
+avg_last5.index = ["Average (Last 5)"]
+st.dataframe(avg_last5, use_container_width=True)
 
 # ----------------------- Last 5 vs Opponent (across seasons) -----------------------
 st.markdown(f"### Last 5 vs {opponent} — Most Recent Seasons")
@@ -540,12 +558,22 @@ match = ts.loc[ts["TEAM_NAME"].str.lower() == opponent.lower()]
 opp_abbr = match["TEAM_ABBR"].iloc[0] if not match.empty else opponent[:3].upper()
 
 vs5 = last_n_vs_opponent(player_id, opp_abbr, SEASONS, n=5)
-cols_show = [c for c in [
-    "SEASON","GAME_DATE","MATCHUP","WL","MIN","PTS","FG3M","REB","AST","OREB","DREB","FTA","FG2M","FG2A","FG3A"
-] if c in vs5.columns]
 if vs5.empty:
     st.info(f"No head-to-head games found vs {opponent} across recent seasons.")
 else:
-    st.dataframe(vs5.sort_values("GAME_DATE", ascending=False)[cols_show], use_container_width=True)
+    # ensure PRA exists; rename 2/3 pointers
+    if "PRA" not in vs5.columns:
+        vs5["PRA"] = vs5.get("PTS",0) + vs5.get("REB",0) + vs5.get("AST",0)
+    vs5_display = vs5.copy()
+    vs5_display = vs5_display.rename(columns={"FG2M":"2PM","FG2A":"2PA","FG3M":"3PM","FG3A":"3PA"})
+    vs_cols = [c for c in ["SEASON"] + meta_cols + ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in vs5_display.columns]
+    vs5_display = vs5_display.sort_values("GAME_DATE", ascending=False)
+    st.dataframe(vs5_display[vs_cols], use_container_width=True)
+
+    # Averages under the table (across available rows)
+    avg_vs_cols = [c for c in ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in vs5_display.columns]
+    avg_vs = vs5_display[avg_vs_cols].mean(numeric_only=True).to_frame().T.round(2)
+    avg_vs.index = ["Average (vs Opp)"]
+    st.dataframe(avg_vs, use_container_width=True)
 
 st.caption("Notes: Pace uses a possession-based proxy from team per-game stats. ORB and DRB use opponent DREB% and OREB adjusters respectively. Career values use proper per-game aggregation from season totals (sum totals / sum GP). If 2025-26 logs are not yet available for a player, the app falls back to the most recent season with data.")
