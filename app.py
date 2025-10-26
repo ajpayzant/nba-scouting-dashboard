@@ -281,7 +281,7 @@ with left:
     st.caption(f"**Team:** {team_name_disp} • **Position:** {pos} • **Seasons:** {exp} • **Games Played:** {gp}")
 
 with right:
-    # Small Opponent chooser (kept out of the sidebar per your spec)
+    # Opponent selector (kept out of the sidebar per your spec)
     opponent = st.selectbox("Opponent", team_list, index=0, key="opponent_sel")
     opp_row = team_adv.loc[team_adv["TEAM_NAME"] == opponent].iloc[0]
 
@@ -395,7 +395,7 @@ with st.expander("Projection Summary (beta – hidden until finalized)"):
     enable_proj = st.checkbox("Show simple projection using recent vs career and opponent defense", value=False)
     if enable_proj:
         try:
-            recent_n = 5 if n_recent == "Season" else int(n_recent)
+            recent_n = 5 if st.session_state.get("recent_sel","Season") == "Season" else int(st.session_state["recent_sel"])
             base_recent = logs.head(recent_n)[["PTS","REB","AST","MIN","FG3M"]].mean(numeric_only=True)
             base_season = logs[["PTS","REB","AST","MIN","FG3M"]].mean(numeric_only=True)
             blended = 0.6 * base_recent + 0.4 * base_season
