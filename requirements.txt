@@ -1,0 +1,7 @@
+# requirements.txt
+streamlit==1.50.0
+nba_api>=1.4,<2.0
+pandas>=2.2
+numpy>=1.26
+altair>=5.0
+requests>=2.31
