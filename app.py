@@ -1,10 +1,10 @@
-# app.py — NBA Player Scouting Dashboard v2 (UX update per request)
+# app.py — NBA Player Scouting Dashboard v2 (UX + Stability rev)
+import time
+import datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
-import datetime
-import time
 
 from nba_api.stats.static import players as static_players, teams as static_teams
 from nba_api.stats.endpoints import (
@@ -20,11 +20,12 @@ st.set_page_config(page_title="NBA Player Scouting Dashboard", layout="wide")
 st.title("🏀 NBA Player Scouting Dashboard")
 
 # ----------------------- Config -----------------------
-CACHE_HOURS   = 12
+CACHE_HOURS = 12
 REQUEST_TIMEOUT = 15
-MAX_RETRIES     = 2
+MAX_RETRIES = 2
 
 def _retry_api(endpoint_cls, kwargs, timeout=REQUEST_TIMEOUT, retries=MAX_RETRIES, sleep=0.8):
+    """Minimal retry wrapper for nba_api endpoint classes."""
     last_err = None
     for i in range(retries + 1):
         try:
@@ -60,32 +61,38 @@ def is_nba_team_id(x):
         return False
 
 def _fmt1(v):
-    try: return f"{float(v):.1f}"
-    except: return "—"
+    try:
+        return f"{float(v):.1f}"
+    except Exception:
+        return "—"
 
-def parse_opponent_abbrev_from_matchup(matchup_str, player_team_abbrev):
+def parse_opp_from_matchup(matchup_str):
     """
-    MATCHUP examples: 'BOS vs LAL', 'BOS @ MIA' → returns 'LAL' / 'MIA'.
+    MATCHUP examples: 'BOS vs LAL', 'BOS @ MIA'
+    Returns the last token (OPP abbr) robustly.
     """
     if not isinstance(matchup_str, str):
         return None
     parts = matchup_str.split()
     if len(parts) >= 3:
-        opp = parts[-1]
-        if opp != player_team_abbrev:
-            return opp
+        return parts[-1].strip()
     return None
 
 def add_shot_breakouts(df):
-    """Ensure columns: MIN PTS REB AST PRA 2PM 2PA 3PM 3PA FTM FTA OREB DREB"""
-    for col in ["MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB","GAME_DATE","MATCHUP","WL"]:
+    """
+    Ensure columns for: MIN PTS REB AST PRA 2PM 2PA 3PM 3PA FTM FTA OREB DREB (+ GAME_DATE, MATCHUP, WL if present)
+    """
+    # Ensure numeric base cols exist
+    for col in ["MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB"]:
         if col not in df.columns:
             df[col] = 0
     df["PRA"] = df["PTS"] + df["REB"] + df["AST"]
     df["2PM"] = df["FGM"] - df["FG3M"]
     df["2PA"] = df["FGA"] - df["FG3A"]
-    keep_cols = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","PRA","2PM","2PA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
-    existing = [c for c in keep_cols if c in df.columns]
+
+    keep_order = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","PRA",
+                  "2PM","2PA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
+    existing = [c for c in keep_order if c in df.columns]
     return df[existing]
 
 # ----------------------- Cached data -----------------------
@@ -100,6 +107,10 @@ def get_teams_static_df():
 
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
 def get_team_context_advanced(season):
+    """
+    Returns league advanced team metrics with ranks (1 = best):
+    DEF_RANK (ascending), PACE_RANK (descending), NET_RANK (descending)
+    """
     try:
         frames = _retry_api(
             leaguedashteamstats.LeagueDashTeamStats,
@@ -117,20 +128,26 @@ def get_team_context_advanced(season):
         if c not in df_adv.columns:
             df_adv[c] = np.nan
 
-    # Compute league ranks (1 = best)
-    df_adv["DEF_RANK"] = df_adv["DEF_RATING"].rank(ascending=True, method="min")
+    # Ranks
+    df_adv["DEF_RANK"] = df_adv["DEF_RATING"].rank(ascending=True,  method="min")
     df_adv["PACE_RANK"] = df_adv["PACE"].rank(ascending=False, method="min")
     df_adv["NET_RANK"]  = df_adv["NET_RATING"].rank(ascending=False, method="min")
-    for c in ["DEF_RANK","PACE_RANK","NET_RANK"]:
-        df_adv[c] = df_adv[c].astype("Int64")
+
+    df_adv["DEF_RANK"] = df_adv["DEF_RANK"].astype("Int64")
+    df_adv["PACE_RANK"] = df_adv["PACE_RANK"].astype("Int64")
+    df_adv["NET_RANK"] = df_adv["NET_RANK"].astype("Int64")
 
     league_pace = float(df_adv["PACE"].mean()) if "PACE" in df_adv.columns else np.nan
     league_def  = float(df_adv["DEF_RATING"].mean()) if "DEF_RATING" in df_adv.columns else np.nan
-    return df_adv[cols_keep + ["DEF_RANK","PACE_RANK","NET_RANK"]], league_pace, league_def
+
+    keep = cols_keep + ["DEF_RANK","PACE_RANK","NET_RANK"]
+    return df_adv[keep], league_pace, league_def
 
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
 def get_season_player_index(season):
-    """LeagueDashPlayerStats to map PLAYER_ID → team, enabling Team → Player filter."""
+    """
+    Season index for Team -> Player filtering (from LeagueDashPlayerStats).
+    """
     try:
         frames = _retry_api(LeagueDashPlayerStats, {"season": season, "per_mode_detailed": "PerGame"})
         df = frames[0] if frames else pd.DataFrame()
@@ -142,7 +159,8 @@ def get_season_player_index(season):
         if c not in df.columns:
             df[c] = np.nan
     df = df[keep].drop_duplicates(subset=["PLAYER_ID"]).reset_index(drop=True)
-    return df.sort_values(["TEAM_NAME","PLAYER_NAME"])
+    df = df.sort_values(["TEAM_NAME","PLAYER_NAME"])
+    return df
 
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
 def get_player_logs(player_id, season):
@@ -155,10 +173,14 @@ def get_player_logs(player_id, season):
         return df
     if "GAME_DATE" in df.columns:
         df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
-    return df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+    df = df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+    return df
 
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
 def get_player_career(player_id):
+    """
+    SeasonTotalsRegularSeason table (one row per season). We'll compute per-game career from totals.
+    """
     try:
         frames = _retry_api(playercareerstats.PlayerCareerStats, {"player_id": player_id})
         return frames[0] if frames else pd.DataFrame()
@@ -174,69 +196,262 @@ def get_common_player_info(player_id):
         return pd.DataFrame()
 
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
-def get_all_season_logs(player_id, season_ids):
-    """Fetch logs for ALL seasons in season_ids and concatenate."""
+def get_all_player_logs_all_seasons(player_id, season_labels):
+    """
+    Concatenate logs across provided season labels, newest first.
+    """
     frames = []
-    for sid in season_ids:
-        df = get_player_logs(player_id, sid)
+    for s in season_labels:
+        df = get_player_logs(player_id, s)
         if not df.empty:
             frames.append(df)
     if not frames:
         return pd.DataFrame()
-    out = pd.concat(frames, ignore_index=True)
-    if "GAME_DATE" in out.columns:
-        out["GAME_DATE"] = pd.to_datetime(out["GAME_DATE"], errors="coerce")
-    return out.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+    out = pd.concat(frames, axis=0, ignore_index=True)
+    out = out.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+    return out
 
-# ----------------------- Sidebar (filters first, Load at bottom) -----------------------
+# ----------------------- Sidebar (Load Data at bottom) -----------------------
 teams_static = get_teams_static_df()
 team_name_to_abbrev = dict(zip(teams_static["full_name"], teams_static["abbreviation"]))
 
 with st.sidebar:
     st.header("Filters")
-    season = st.selectbox("Season", SEASONS, index=0)
 
-    # Build team list for the selected season (later after team_adv is available we re-use it)
-    st.caption("Select Team → (optional) Search → Player → Opponent. Then click **Load Data** below.")
+    season = st.selectbox("Season", SEASONS, index=0, key="season_sel")
 
-# We need team_adv to fill teams; load small context once, but keep heavy player logs gated by button.
-team_adv, league_pace_mean, league_def_mean = get_team_context_advanced(season)
+    # We'll build team list after we load league context for the chosen season.
+    # To keep the UX smooth, show placeholders until Load Data runs.
+    sel_team = st.selectbox("Team", ["(Load data to populate)"], index=0, key="team_sel")
+    q = st.text_input("Search player", key="player_search").strip()
+    player_name = st.selectbox("Player", ["(Load data to populate)"], index=0, key="player_sel")
+    opponent = st.selectbox("Opponent", ["(Load data to populate)"], index=0, key="opp_sel")
+    n_recent = st.selectbox("Recent window", ["Season", 5, 10, 15, 20], index=1, key="recent_sel")
+
+    st.divider()
+    go = st.button("Load Data", type="primary", key="go_btn")
+
+# Short-circuit until user clicks
+if not go:
+    st.caption("👈 Choose filters then click **Load Data**. (Team/Player/Opponent will populate after loading league context.)")
+    st.stop()
+
+# ----------------------- After Load: populate Team/Player/Opponent from season context -----------------------
+with st.spinner("Loading league/team context..."):
+    team_adv, league_pace_mean, league_def_mean = get_team_context_advanced(season)
+
 if team_adv.empty:
     st.error("Unable to load league/team context for this season.")
     st.stop()
 
+team_list = team_adv["TEAM_NAME"].sort_values().tolist()
+
 with st.sidebar:
-    team_list = team_adv["TEAM_NAME"].sort_values().tolist()
-    sel_team = st.selectbox("Team", ["(All teams)"] + team_list, index=0)
+    # Re-render Team, Player, Opponent with populated choices (preserve previous entries where possible)
+    st.subheader("Filters")
+    sel_team = st.selectbox("Team", ["(All teams)"] + team_list,
+                            index=(["(All teams)"] + team_list).index(st.session_state.get("team_sel", "(All teams)"))
+                                   if st.session_state.get("team_sel") in (["(All teams)"] + team_list)
+                                   else 0,
+                            key="team_sel_live")
+    # Build player index
+    with st.spinner("Loading players for season..."):
+        season_players = get_season_player_index(season)
 
-    season_players = get_season_player_index(season)
-    q = st.text_input("Search player").strip()
-
+    # Apply team + search filter
     filtered_players = season_players.copy()
     if sel_team != "(All teams)":
         filtered_players = filtered_players[filtered_players["TEAM_NAME"] == sel_team]
-    if q:
-        filtered_players = filtered_players[filtered_players["PLAYER_NAME"].str.contains(q, case=False, na=False)]
+    if st.session_state.get("player_search"):
+        filtered_players = filtered_players[
+            filtered_players["PLAYER_NAME"].str.contains(st.session_state["player_search"], case=False, na=False)
+        ]
 
     if filtered_players.empty:
         st.info("No players match your filters.")
         st.stop()
 
-    player_name = st.selectbox("Player", filtered_players["PLAYER_NAME"].tolist())
+    # Try to keep the same player selected if still in list
+    default_player = st.session_state.get("player_sel")
+    if default_player in filtered_players["PLAYER_NAME"].tolist():
+        player_index = filtered_players["PLAYER_NAME"].tolist().index(default_player)
+    else:
+        player_index = 0
+
+    player_name = st.selectbox("Player", filtered_players["PLAYER_NAME"].tolist(), index=player_index, key="player_sel_live")
     player_row = filtered_players[filtered_players["PLAYER_NAME"] == player_name].iloc[0]
     player_id  = int(player_row["PLAYER_ID"])
-    player_team_abbrev = str(player_row.get("TEAM_ABBREVIATION", ""))
+    player_team_abbrev = str(player_row.get("TEAM_ABBREVIATION", "")).strip()
 
-    opponent = st.selectbox("Opponent", team_list, index=0)
-    n_recent = st.selectbox("Recent window", ["Season", 5, 10, 15, 20], index=1)
+    # Opponent select
+    opp_list = team_list
+    default_opp = st.session_state.get("opp_sel")
+    if default_opp in opp_list:
+        opp_index = opp_list.index(default_opp)
+    else:
+        opp_index = 0
+    opponent = st.selectbox("Opponent", opp_list, index=opp_index, key="opp_sel_live")
 
-    st.divider()
-    go = st.button("Load Data", type="primary")  # <-- at bottom as requested
+    n_recent = st.selectbox("Recent window", ["Season", 5, 10, 15, 20],
+                            index=["Season", 5, 10, 15, 20].index(st.session_state.get("recent_sel","Season")),
+                            key="recent_sel_live")
 
-# Basic state to avoid wiping selections unnecessarily
-if "loaded" not in st.session_state:
-    st.session_state.loaded = False
-if go:
-    st.session_state.loaded = True
-if not st.session_state.loaded:
-    st.caption("➡
+# ----------------------- Fetch Player Data -----------------------
+with st.spinner("Fetching player logs & info..."):
+    logs = get_player_logs(player_id, season)
+    if logs.empty:
+        st.error("No game logs for this player/season.")
+        st.stop()
+    career_df = get_player_career(player_id)
+    cpi = get_common_player_info(player_id)
+
+# ----------------------- Header Section -----------------------
+left, right = st.columns([2, 1])
+
+with left:
+    st.subheader(f"{player_name} — {season}")
+    team_name_disp = (cpi["TEAM_NAME"].iloc[0] if ("TEAM_NAME" in cpi.columns and not cpi.empty) else player_row.get("TEAM_NAME","Unknown"))
+    pos = (cpi["POSITION"].iloc[0] if ("POSITION" in cpi.columns and not cpi.empty) else "N/A")
+    exp = (cpi["SEASON_EXP"].iloc[0] if ("SEASON_EXP" in cpi.columns and not cpi.empty) else "N/A")
+    gp = len(logs)
+    st.caption(f"**Team:** {team_name_disp} • **Position:** {pos} • **Seasons:** {exp} • **Games Played:** {gp}")
+
+with right:
+    opp_row = team_adv.loc[team_adv["TEAM_NAME"] == opponent].iloc[0]
+    d_rating = opp_row.get("DEF_RATING", np.nan)
+    pace     = opp_row.get("PACE", np.nan)
+    net      = opp_row.get("NET_RATING", np.nan)
+    d_rank   = int(opp_row.get("DEF_RANK")) if pd.notna(opp_row.get("DEF_RANK")) else None
+    p_rank   = int(opp_row.get("PACE_RANK")) if pd.notna(opp_row.get("PACE_RANK")) else None
+    n_rank   = int(opp_row.get("NET_RANK"))  if pd.notna(opp_row.get("NET_RANK"))  else None
+
+    st.markdown(f"**Opponent:** {opponent}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("DEF Rating", _fmt1(d_rating))
+    c1.caption(f"Rank: {d_rank}/30" if d_rank else "Rank: —")
+    c2.metric("PACE", _fmt1(pace))
+    c2.caption(f"Rank: {p_rank}/30" if p_rank else "Rank: —")
+    c3.metric("NET Rating", _fmt1(net))
+    c3.caption(f"Rank: {n_rank}/30" if n_rank else "Rank: —")
+
+# ----------------------- Trends -----------------------
+st.markdown(f"### Recent Trends (Last {n_recent if n_recent!='Season' else 'Season'} Games)")
+trend_cols = [c for c in ["MIN","PTS","REB","AST","PRA","FG3M"] if c in logs.columns]
+trend_df = logs[["GAME_DATE"] + trend_cols].head(int(n_recent) if n_recent != "Season" else len(logs)).copy()
+trend_df = trend_df.sort_values("GAME_DATE")
+
+if "GAME_DATE" in trend_df.columns and len(trend_cols) > 0 and len(trend_df) > 0:
+    for s in trend_cols:
+        chart = (
+            alt.Chart(trend_df)
+            .mark_line(point=True)
+            .encode(x="GAME_DATE:T", y=alt.Y(s, title=s))
+            .properties(height=160)
+        )
+        st.altair_chart(chart, use_container_width=True)
+else:
+    st.info("No trend data available to chart.")
+
+# ----------------------- Comparison Windows -----------------------
+st.markdown("### Compare Windows (Career / Season / L5 / L15)")
+
+def avg(df, n):
+    if df.empty: return pd.Series(dtype=float)
+    if n == "Season": return df.mean(numeric_only=True)
+    return df.head(int(n)).mean(numeric_only=True)
+
+# Career per-game (regular season): weighted by GP from career totals table
+def career_per_game(career_df, cols=("PTS","REB","AST","MIN")):
+    if career_df.empty or "GP" not in career_df.columns:
+        return pd.Series({c: np.nan for c in cols}, dtype=float)
+    needed = list(set(cols) | {"GP"})
+    for c in needed:
+        if c not in career_df.columns:
+            career_df[c] = 0
+    total_gp = career_df["GP"].sum()
+    if total_gp == 0:
+        return pd.Series({c: np.nan for c in cols}, dtype=float)
+    out = {}
+    for c in cols:
+        out[c] = career_df[c].sum() / total_gp  # totals / total GP -> true career per-game
+    return pd.Series(out).astype(float)
+
+kpi = [c for c in ["PTS","REB","AST","MIN"] if (c in logs.columns) or (c in career_df.columns)]
+career_pg = career_per_game(career_df, cols=kpi)
+vals = {
+    "Career": career_pg,
+    "Season": avg(logs[kpi], "Season") if set(kpi).issubset(logs.columns) else pd.Series({s: np.nan for s in kpi}),
+    "L5": avg(logs[kpi], 5) if set(kpi).issubset(logs.columns) else pd.Series({s: np.nan for s in kpi}),
+    "L15": avg(logs[kpi], 15) if set(kpi).issubset(logs.columns) else pd.Series({s: np.nan for s in kpi}),
+}
+cmp_df = pd.DataFrame(vals).round(2)
+st.dataframe(cmp_df.style.format(numeric_format_map(cmp_df)), use_container_width=True, height=_auto_height(cmp_df))
+
+# ----------------------- Last 5 Games (current season) -----------------------
+st.markdown("### Last 5 Games")
+cols_base = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
+last5 = logs[cols_base].head(5).copy()
+last5 = add_shot_breakouts(last5)
+num_fmt = {c: "{:.0f}" for c in last5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
+st.dataframe(last5.style.format(num_fmt), use_container_width=True, height=_auto_height(last5))
+
+# ----------------------- Last 5 vs Opponent (across ALL seasons) -----------------------
+st.markdown(f"### Last 5 vs {opponent} (All Seasons)")
+opp_abbrev = team_name_to_abbrev.get(opponent)
+if not opp_abbrev:
+    # fallback: use TEAM_ABBREVIATION from team_adv
+    opp_row = team_adv.loc[team_adv["TEAM_NAME"] == opponent].iloc[0]
+    opp_abbrev = str(opp_row.get("TEAM_ABBREVIATION", "")).strip() or None
+
+# Determine season label list from career_df (preferred) or fallback to global SEASONS
+if "SEASON" in career_df.columns and not career_df.empty:
+    season_labels = list(career_df["SEASON"].dropna().unique())
+    # Ensure recent first (format like '2019-20', '2020-21')
+    def _yr(s): 
+        try: return int(s.split("-")[0])
+        except: return -1
+    season_labels = sorted(season_labels, key=_yr, reverse=True)
+else:
+    season_labels = SEASONS  # fallback
+
+if opp_abbrev:
+    all_logs = get_all_player_logs_all_seasons(player_id, season_labels)
+    if all_logs.empty or "MATCHUP" not in all_logs.columns:
+        st.info(f"No matchup data available for {opponent}.")
+    else:
+        all_logs = all_logs.copy()
+        all_logs["OPP_ABBR"] = all_logs["MATCHUP"].apply(parse_opp_from_matchup)
+        vs_opp_all = all_logs[all_logs["OPP_ABBR"] == opp_abbrev]
+        vs_opp5 = vs_opp_all[cols_base].head(5).copy() if not vs_opp_all.empty else pd.DataFrame(columns=cols_base)
+        vs_opp5 = add_shot_breakouts(vs_opp5)
+        if vs_opp5.empty:
+            st.info(f"No historical games vs {opponent}.")
+        else:
+            num_fmt2 = {c: "{:.0f}" for c in vs_opp5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
+            st.dataframe(vs_opp5.style.format(num_fmt2), use_container_width=True, height=_auto_height(vs_opp5))
+else:
+    st.info("Could not resolve opponent abbreviation; skipping opponent-specific table.")
+
+# ----------------------- Projections (hidden) -----------------------
+with st.expander("Projection Summary (beta – hidden until finalized)"):
+    enable_proj = st.checkbox("Show simple projection using recent vs career and opponent defense", value=False)
+    if enable_proj:
+        try:
+            recent_n = 5 if n_recent == "Season" else int(n_recent)
+            base_recent = logs.head(recent_n)[["PTS","REB","AST","MIN","FG3M"]].mean(numeric_only=True)
+            base_season = logs[["PTS","REB","AST","MIN","FG3M"]].mean(numeric_only=True)
+            blended = 0.6 * base_recent + 0.4 * base_season
+
+            opp_row = team_adv.loc[team_adv["TEAM_NAME"] == opponent].iloc[0]
+            league_def = team_adv["DEF_RATING"].mean()
+            opp_def   = opp_row.get("DEF_RATING", league_def)
+            def_adj   = (league_def / opp_def) if (pd.notna(league_def) and pd.notna(opp_def) and opp_def != 0) else 1.0
+
+            proj = (blended * def_adj).to_frame("Proj").T
+            proj = proj[["PTS","REB","AST","MIN","FG3M"]].round(2)
+            st.dataframe(proj, use_container_width=True, height=_auto_height(proj))
+        except Exception as e:
+            st.info(f"Projection temporarily unavailable: {e}")
+
+# ----------------------- Footer -----------------------
+st.caption("Notes: Manual load, per-call timeouts/retries. Opponent ranks shown below metrics (1 = best). Career per-game is weighted by GP across regular seasons.")
