@@ -1,9 +1,0 @@
-streamlit==1.37.1
-pandas==2.2.2
-numpy==1.26.4
-altair==5.3.0
-nba_api==1.5.1
-requests==2.32.3
-urllib3==1.26.18
-python-dateutil==2.9.0.post0
-pytz==2024.2
