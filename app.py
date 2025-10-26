@@ -13,7 +13,6 @@ from nba_api.stats.endpoints import (
     leaguedashteamstats,
     LeagueDashPlayerStats,
     commonplayerinfo,
-    leaguegamelog,
 )
 
 # ----------------------- Streamlit Setup -----------------------
@@ -22,7 +21,7 @@ st.title("NBA Player Scouting Dashboard")
 
 # ----------------------- Config -----------------------
 CACHE_HOURS = 12
-LEAGUE_DEF_REF = 112.0  # coarse league baseline for defense scaling
+LEAGUE_DEF_REF = 112.0  # coarse league baseline for defense scaling (kept for continuity)
 DEFAULT_SEASON = "2025-26"  # requested default
 
 # ----------------------- Utilities -----------------------
@@ -66,13 +65,6 @@ def form_score(series: pd.Series, k: int = 5) -> float:
     z = (mu_r - mu_s) / sd
     return float(np.clip(50 + 15*z, 0, 100))
 
-def opponent_adjustment(def_rating: float, pace_val: float,
-                        league_def: float, league_pace_mean: float) -> float:
-    # lower DEF_RATING => tougher => def_factor > 1 (scales down projection)
-    def_factor  = league_def / max(def_rating, 1e-9)
-    pace_factor = pace_val / max(league_pace_mean, 1e-9)
-    return float(def_factor * pace_factor)
-
 def window_avg(df: pd.DataFrame, n: int, cols) -> pd.Series:
     if len(df) < 1:
         return pd.Series({c: np.nan for c in cols})
@@ -102,22 +94,75 @@ def career_pg_counting_stat(career_df: pd.DataFrame, col: str) -> float:
         return np.nan
     return float(s_tot[mask].sum() / s_gp[mask].sum())
 
-# ---------- Render helpers & ordinal ----------
+# ---------- NEW: tiny helpers to render dataframes neatly ----------
 def _auto_height(df: pd.DataFrame, row_px: int = 34, header_px: int = 38, max_px: int = 900) -> int:
+    """Compute a height that fits all rows to avoid vertical scroll in st.dataframe."""
     rows = max(len(df), 1)
     return min(max_px, header_px + row_px * rows + 8)
 
-def render_summary_table(df_indexed: pd.DataFrame):
+def render_summary_table(df_indexed: pd.DataFrame, highlight_rows=None):
+    """
+    Format to 2 decimals, highlight full rows (e.g., PRA, 3PM), and render with
+    a height that avoids vertical scrolling.
+    """
+    if highlight_rows is None:
+        highlight_rows = set()
     styler = df_indexed.style.format("{:.2f}")
+    def _row_style(row):
+        if row.name in highlight_rows:
+            return ["font-weight: 700; background-color: #fff3cd;"] * len(row)
+        return [""] * len(row)
+    styler = styler.apply(_row_style, axis=1)
     h = _auto_height(df_indexed)
     st.dataframe(styler, use_container_width=True, height=h)
 
-def ordinal(n: int) -> str:
-    try:
-        n = int(n)
-    except Exception:
-        return "—"
-    return "%d%s" % (n, "tsnrhtdd"[(n//10%10!=1)*(n%10<4)*n%10::4])
+# ---------- Minutes projection (simple, robust, recent-weighted) ----------
+def _minutes_cleaned(logs: pd.DataFrame) -> pd.Series:
+    """Drop anomaly games where MIN < 10% of the season median minutes."""
+    m = pd.to_numeric(logs.get("MIN", np.nan), errors="coerce").dropna()
+    if m.empty:
+        return m
+    season_median = float(m.median())
+    thresh = 0.10 * season_median
+    m_clean = m[m >= thresh]
+    return m_clean if len(m_clean) else m
+
+def _window_mean(m: pd.Series, n: int) -> float:
+    if m.empty:
+        return np.nan
+    return float(pd.to_numeric(m.head(n), errors="coerce").dropna().mean()) if len(m) else np.nan
+
+def _recent_blend_from_windows(m: pd.Series) -> float:
+    windows = [(5, 0.50), (10, 0.25), (15, 0.15), (20, 0.10)]
+    parts, wts = [], []
+    for n, w in windows:
+        v = _window_mean(m, n)
+        if np.isfinite(v):
+            parts.append(w * v); wts.append(w)
+    if not parts:
+        return float(np.nan)
+    return float(sum(parts) / sum(wts))
+
+def project_minutes_simple(logs: pd.DataFrame,
+                           career_raw: pd.DataFrame,
+                           w_recent: float, w_season: float, w_career: float) -> float:
+    m_clean = _minutes_cleaned(logs)
+    recent_blend = _recent_blend_from_windows(m_clean)
+    season_mean  = float(m_clean.mean()) if len(m_clean) else np.nan
+    career_pg    = career_pg_counting_stat(career_raw, "MIN")
+    if not np.isfinite(recent_blend): recent_blend = season_mean
+    if not np.isfinite(season_mean):  season_mean  = career_pg
+    wr, ws, wc = (w_recent or 0.0), (w_season or 0.0), (w_career or 0.0)
+    total = wr + ws + wc
+    if total <= 0:
+        wr, ws, wc = 0.55, 0.30, 0.15; total = 1.0
+    wr, ws, wc = wr/total, ws/total, wc/total
+    parts = []
+    if np.isfinite(recent_blend): parts.append(wr * recent_blend)
+    if np.isfinite(season_mean):  parts.append(ws * season_mean)
+    if np.isfinite(career_pg):    parts.append(wc * career_pg)
+    MIN_proj = float(sum(parts)) if parts else 0.0
+    return max(0.0, MIN_proj)
 
 # ----------------------- Season detection & caching -----------------------
 @st.cache_data(ttl=6*3600)
@@ -137,133 +182,88 @@ def detect_available_seasons(max_back_years: int = 12) -> list[str]:
     return available
 
 @st.cache_data(ttl=CACHE_HOURS*3600)
-def get_all_players_df():
-    """All NBA players (active + inactive). Prospects not yet in NBA DB won't be present."""
-    return pd.DataFrame(static_players.get_players())
+def get_active_players_df():
+    return pd.DataFrame(static_players.get_active_players())
 
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_teams_static_df():
     return pd.DataFrame(static_teams.get_teams())
 
-# ---- robust regular-season start detection to avoid preseason bleed ----
-@st.cache_data(ttl=CACHE_HOURS*3600)
-def _regular_season_start_date(season: str) -> str:
-    """
-    Find first Regular Season game date (YYYY-MM-DD) via team game logs.
-    Prevents preseason spill into team dashboards.
-    """
-    try:
-        df = leaguegamelog.LeagueGameLog(
-            season=season,
-            season_type_all_star="Regular Season",
-            player_or_team_abbreviation="T",
-        ).get_data_frames()[0]
-    except Exception:
-        df = pd.DataFrame()
-
-    if df.empty or "GAME_DATE" not in df.columns:
-        return f"{season.split('-')[0]}-10-01"
-
-    try:
-        gdates = pd.to_datetime(df["GAME_DATE"], format="mixed", errors="coerce")
-    except TypeError:
-        gdates = pd.to_datetime(df["GAME_DATE"], infer_datetime_format=True, errors="coerce")
-
-    first = gdates.min()
-    if pd.isna(first):
-        return f"{season.split('-')[0]}-10-01"
-    return first.strftime("%Y-%m-%d")
-
+# ---------- NEW: Team tables with Opponent profile & league means ----------
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_team_tables(season: str):
-    """
-    Authoritative opponent context restricted to Regular Season only
-    by applying date_from = first RS game.
-    Advanced: PACE, DEF_RATING, DREB_PCT
-    Opponent: OPP_PTS -> PTS_ALLOWED
-    Base: OREB
-    """
-    date_from = _regular_season_start_date(season)
-
-    # Advanced (PACE, DEF_RATING, DREB_PCT)
-    df_adv_all = leaguedashteamstats.LeagueDashTeamStats(
-        season=season,
-        per_mode_detailed="PerGame",
-        measure_type_detailed_defense="Advanced",
-        season_type_all_star="Regular Season",
-        date_from_nullable=date_from,
+    # Advanced: for PACE, DEF_RATING (Regular Season only by default)
+    df_adv = leaguedashteamstats.LeagueDashTeamStats(
+        season=season, per_mode_detailed="PerGame", measure_type_detailed="Advanced"
     ).get_data_frames()[0]
 
-    # Opponent (Points Allowed)
-    df_opp_all = leaguedashteamstats.LeagueDashTeamStats(
-        season=season,
-        per_mode_detailed="PerGame",
-        measure_type_detailed_defense="Opponent",
-        season_type_all_star="Regular Season",
-        date_from_nullable=date_from,
+    # Opponent profile: OPP_* per game
+    df_opp = leaguedashteamstats.LeagueDashTeamStats(
+        season=season, per_mode_detailed="PerGame", measure_type_detailed="Opponent"
     ).get_data_frames()[0]
 
-    # Base (OREB for rebound adjustments)
-    df_base_all = leaguedashteamstats.LeagueDashTeamStats(
-        season=season,
-        per_mode_detailed="PerGame",
-        measure_type_detailed_defense="Base",
-        season_type_all_star="Regular Season",
-        date_from_nullable=date_from,
+    # Base (for OREB and a pace proxy fallback)
+    df_base = leaguedashteamstats.LeagueDashTeamStats(
+        season=season, per_mode_detailed="PerGame"
     ).get_data_frames()[0]
 
-    # NBA teams only
-    df_adv  = df_adv_all[df_adv_all["TEAM_ID"].apply(is_nba_team_id)].copy()
-    df_opp  = df_opp_all[df_opp_all["TEAM_ID"].apply(is_nba_team_id)].copy()
-    df_base = df_base_all[df_base_all["TEAM_ID"].apply(is_nba_team_id)].copy()
+    # Keep only NBA teams and key cols
+    df_adv = df_adv[df_adv["TEAM_ID"].apply(is_nba_team_id)].copy()
+    df_opp = df_opp[df_opp["TEAM_ID"].apply(is_nba_team_id)].copy()
+    df_base = df_base[df_base["TEAM_ID"].apply(is_nba_team_id)].copy()
 
-    # Select / rename columns
-    keep_adv = ["TEAM_ID","TEAM_NAME","PACE","DEF_RATING","DREB_PCT"]
-    keep_opp = ["TEAM_ID","OPP_PTS"]
-    keep_bas = ["TEAM_ID","OREB"]
+    adv_keep = ["TEAM_ID","TEAM_NAME","PACE","DEF_RATING","PACE_RANK","DEF_RATING_RANK"]
+    opp_keep = ["TEAM_ID","TEAM_NAME","OPP_FGA","OPP_FG3A","OPP_FTA","OPP_OREB","OPP_DREB","OPP_PTS","OPP_AST"]
+    base_keep = ["TEAM_ID","TEAM_NAME","MIN","FGA","FTA","OREB","TOV"]
 
-    df_adv = df_adv[keep_adv].copy()
-    df_opp = df_opp[keep_opp].rename(columns={"OPP_PTS":"PTS_ALLOWED"}).copy()
-    df_base = df_base[keep_bas].copy()
+    df_adv = df_adv[adv_keep].copy()
+    df_opp = df_opp[opp_keep].copy()
+    df_base = df_base[base_keep].copy()
+    df_base["PACE_PROXY"] = df_base.apply(pace_proxy_row, axis=1)
 
-    # Merge
+    # League means used for normalization
+    league_pace_mean = float(df_adv["PACE"].mean())
+    league_opp_fg3a_mean = float(df_opp["OPP_FG3A"].mean())
+    league_opp_fta_mean  = float(df_opp["OPP_FTA"].mean())
+    league_opp_fga_mean  = float(df_opp["OPP_FGA"].mean())
+    league_opp_2pa_mean  = float((df_opp["OPP_FGA"] - df_opp["OPP_FG3A"]).mean())
+    league_opp_oreb_mean = float(df_opp["OPP_OREB"].mean())
+    league_opp_dreb_mean = float(df_opp["OPP_DREB"].mean())
+    league_opp_ast_mean  = float(df_opp["OPP_AST"].mean())
+
+    # Merge to one context table
     teams_ctx = (
-        df_adv.merge(df_opp, on="TEAM_ID", how="left")
-              .merge(df_base, on="TEAM_ID", how="left")
-              .sort_values("TEAM_NAME")
-              .reset_index(drop=True)
+        df_adv
+        .merge(df_opp, on=["TEAM_ID","TEAM_NAME"], how="left")
+        .merge(df_base[["TEAM_ID","PACE_PROXY","OREB"]], on="TEAM_ID", how="left")
+        .sort_values("TEAM_NAME").reset_index(drop=True)
     )
 
-    # League means for adjustments
-    league_pace_mean = float(pd.to_numeric(teams_ctx["PACE"], errors="coerce").mean())
-    league_dreb_pct_mean = float(pd.to_numeric(teams_ctx["DREB_PCT"], errors="coerce").mean()) if "DREB_PCT" in teams_ctx.columns else np.nan
-    league_oreb_mean = float(pd.to_numeric(teams_ctx["OREB"], errors="coerce").mean())
-
-    # Ranks: DEF & PTS_ALLOWED asc (lower is better), PACE desc (higher is better)
-    teams_ctx["RANK_DEF"]  = pd.to_numeric(teams_ctx["DEF_RATING"], errors="coerce").rank(method="min", ascending=True).astype(int)
-    teams_ctx["RANK_PA"]   = pd.to_numeric(teams_ctx["PTS_ALLOWED"], errors="coerce").rank(method="min", ascending=True).astype(int)
-    teams_ctx["RANK_PACE"] = pd.to_numeric(teams_ctx["PACE"], errors="coerce").rank(method="min", ascending=False).astype(int)
-
-    return teams_ctx, league_pace_mean, league_dreb_pct_mean, league_oreb_mean
+    # Return context + league means needed downstream
+    league_means = {
+        "PACE": league_pace_mean,
+        "OPP_FG3A": league_opp_fg3a_mean,
+        "OPP_FTA": league_opp_fta_mean,
+        "OPP_FGA": league_opp_fga_mean,
+        "OPP_2PA": league_opp_2pa_mean,
+        "OPP_OREB": league_opp_oreb_mean,
+        "OPP_DREB": league_opp_dreb_mean,
+        "OPP_AST": league_opp_ast_mean,
+    }
+    return teams_ctx, league_means
 
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_player_logs(player_id: int, season: str):
     df = playergamelog.PlayerGameLog(player_id=player_id, season=season).get_data_frames()[0]
     if df.empty:
         return df
-    # Robust mixed-format parsing
-    try:
-        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], format="mixed", errors="coerce")
-    except TypeError:
-        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], infer_datetime_format=True, errors="coerce")
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     df = df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
     # derive 2P components
-    df["FG3M"] = pd.to_numeric(df.get("FG3M", 0), errors="coerce")
-    df["FG3A"] = pd.to_numeric(df.get("FG3A", 0), errors="coerce")
-    df["FGM"]  = pd.to_numeric(df.get("FGM",  0), errors="coerce")
-    df["FGA"]  = pd.to_numeric(df.get("FGA",  0), errors="coerce")
-    df["FG2M"] = (df["FGM"] - df["FG3M"]).clip(lower=0)
-    df["FG2A"] = (df["FGA"] - df["FG3A"]).clip(lower=0)
+    df["FG2M"] = pd.to_numeric(df.get("FGM", 0), errors="coerce") - pd.to_numeric(df.get("FG3M", 0), errors="coerce")
+    df["FG2A"] = pd.to_numeric(df.get("FGA", 0), errors="coerce") - pd.to_numeric(df.get("FG3A", 0), errors="coerce")
+    df["FG2M"] = df["FG2M"].clip(lower=0)
+    df["FG2A"] = df["FG2A"].clip(lower=0)
     # ensure columns & derive PRA
     for col in ["PTS","REB","AST","FG3M","FG3A","OREB","DREB","MIN"]:
         if col not in df.columns:
@@ -282,18 +282,6 @@ def get_common_player_info(player_id: int):
     except Exception:
         return pd.DataFrame()
 
-def is_rookie_by_cpi(cpi_df: pd.DataFrame) -> bool:
-    try:
-        if cpi_df.empty:
-            return False
-        val = cpi_df.get("SEASON_EXP")
-        if val is None or len(val) == 0:
-            return False
-        exp = val.iloc[0]
-        return pd.to_numeric(exp, errors="coerce") == 0
-    except Exception:
-        return False
-
 def best_season_for_player(player_id: int, preferred: str, season_pool: list[str]) -> str:
     logs = get_player_logs(player_id, preferred)
     if not logs.empty:
@@ -307,23 +295,17 @@ def best_season_for_player(player_id: int, preferred: str, season_pool: list[str
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def last_n_vs_opponent(player_id: int, opp_abbr: str, seasons_list: list[str], n: int = 5) -> pd.DataFrame:
     frames = []
-    opp_abbr = (opp_abbr or "").upper()
     for s in seasons_list:
-        try:
-            df = get_player_logs(player_id, s)
-        except Exception:
+        df = get_player_logs(player_id, s)
+        if df.empty:
             continue
-        if df.empty or "MATCHUP" not in df.columns:
-            continue
-        matchup_upper = df["MATCHUP"].astype(str).str.upper()
-        mask = matchup_upper.str.contains(rf"\b{re.escape(opp_abbr)}\b", na=False, regex=True)
+        mask = df["MATCHUP"].str.contains(rf"\b{re.escape(opp_abbr)}\b", na=False, regex=True)
         part = df.loc[mask].copy()
         if not part.empty:
             part["SEASON"] = s
             frames.append(part)
         if sum(len(f) for f in frames) >= n:
             break
-
     if not frames:
         return pd.DataFrame()
     all_df = pd.concat(frames, ignore_index=True)
@@ -335,10 +317,7 @@ def last_n_vs_opponent(player_id: int, opp_abbr: str, seasons_list: list[str], n
     return all_df
 
 # ----------------------- Sidebar Controls -----------------------
-players_df = get_all_players_df()
-players_df = players_df[["id","full_name","is_active"]].copy()
-players_df = players_df.sort_values("full_name").reset_index(drop=True)
-
+players_df = get_active_players_df().sort_values("full_name")
 teams_static_df = get_teams_static_df()
 
 SEASONS = detect_available_seasons(max_back_years=12)
@@ -351,185 +330,123 @@ with st.sidebar:
     q = st.text_input("Search player", value="Jayson Tatum")
     filtered = players_df[players_df["full_name"].str.contains(q, case=False, na=False)]
     if filtered.empty:
-        st.info("No matching NBA players found. If you're searching a prospect (e.g., Cooper Flagg), they may not be in the NBA database yet.")
         st.stop()
     player_name = st.selectbox("Player", filtered["full_name"].tolist())
-    player_row = filtered.loc[filtered["full_name"] == player_name].iloc[0]
-    player_id = int(player_row["id"])
-    is_active = bool(player_row.get("is_active", False))
+    player_id = int(filtered.loc[filtered["full_name"] == player_name, "id"].iloc[0])
 
-    teams_ctx, league_pace_mean, league_dreb_pct_mean, league_oreb_mean = get_team_tables(season)
+    teams_ctx, league_means = get_team_tables(season)
     opponent = st.selectbox("Opponent", teams_ctx["TEAM_NAME"].tolist())
 
-    # Window now includes "Season"
-    n_recent_choice = st.radio("Recent window", ["Season", 5, 10, 15, 20, 25], horizontal=True, index=1)
-    n_recent = n_recent_choice if isinstance(n_recent_choice, int) else None
-
+    n_recent = st.radio("Recent window (games)", [5, 10, 15, 20, 25], horizontal=True, index=0)
     w_recent = st.slider("Weight: Recent", 0.0, 1.0, 0.55, 0.05)
     w_season = st.slider("Weight: Season", 0.0, 1.0, 0.30, 0.05)
     w_career = st.slider("Weight: Career", 0.0, 1.0, 0.15, 0.05)
 
-# ----------------------- Data fetch & Rookie/Prospect handling -----------------------
-cpi = get_common_player_info(player_id)
-rookie = is_rookie_by_cpi(cpi)
-
-if cpi.empty and not is_active:
-    st.error(
-        f"**{player_name}** is not yet in the NBA stats database. "
-        "Prospects (e.g., Cooper Flagg, Dylan Harper, V.J. Edgecombe, Hugo Gonzalez) "
-        "become available once the NBA adds them to the official database."
-    )
-    st.stop()
-
+# ----------------------- Data fetch -----------------------
 season_used = best_season_for_player(player_id, season, SEASONS)
-if rookie and season_used != season:
-    st.warning(f"{player_name} appears to be a rookie. Showing the only season with available logs: **{season_used}**.")
 logs = get_player_logs(player_id, season_used)
 if logs.empty:
-    if rookie or not is_active:
-        st.error("No NBA game logs available yet for this player.")
-    else:
-        st.error("No game logs found for this player/season.")
+    st.error("No game logs found for this player/season.")
     st.stop()
-
 career_raw = get_player_career(player_id)
+cpi = get_common_player_info(player_id)
 
 # ----------------------- Opponent Context -----------------------
 opp_row = teams_ctx.loc[teams_ctx["TEAM_NAME"] == opponent].iloc[0]
-opp_def       = float(opp_row["DEF_RATING"])
-opp_pace      = float(opp_row["PACE"])
-opp_pts_allow = float(opp_row["PTS_ALLOWED"]) if "PTS_ALLOWED" in opp_row.index and pd.notna(opp_row["PTS_ALLOWED"]) else np.nan
 
-rank_def  = int(opp_row.get("RANK_DEF",  np.nan)) if pd.notna(opp_row.get("RANK_DEF",  np.nan)) else None
-rank_pace = int(opp_row.get("RANK_PACE", np.nan)) if pd.notna(opp_row.get("RANK_PACE", np.nan)) else None
-rank_pa   = int(opp_row.get("RANK_PA",   np.nan)) if pd.notna(opp_row.get("RANK_PA",   np.nan)) else None
+# Baseline opponent numbers
+opp_def   = float(opp_row["DEF_RATING"])
+opp_pace  = float(opp_row["PACE"])
+opp_fga   = float(opp_row.get("OPP_FGA", np.nan))
+opp_fg3a  = float(opp_row.get("OPP_FG3A", np.nan))
+opp_2pa   = float((opp_fga - opp_fg3a)) if np.isfinite(opp_fga) and np.isfinite(opp_fg3a) else np.nan
+opp_fta   = float(opp_row.get("OPP_FTA", np.nan))
+opp_oreb  = float(opp_row.get("OPP_OREB", np.nan))
+opp_dreb  = float(opp_row.get("OPP_DREB", np.nan))
+opp_opp_ast = float(opp_row.get("OPP_AST", np.nan))  # assists allowed
 
-opp_dreb_pct = float(opp_row["DREB_PCT"]) if "DREB_PCT" in teams_ctx.columns else np.nan
-opp_oreb     = float(opp_row["OREB"])
+# League means for normalization
+league_pace_mean = float(league_means["PACE"])
+L_OPP_FG3A = float(league_means["OPP_FG3A"])
+L_OPP_FTA  = float(league_means["OPP_FTA"])
+L_OPP_2PA  = float(league_means["OPP_2PA"])
+L_OPP_OREB = float(league_means["OPP_OREB"])
+L_OPP_DREB = float(league_means["OPP_DREB"])
+L_OPP_AST  = float(league_means["OPP_AST"])
 
-AdjFactor = opponent_adjustment(opp_def, opp_pace, LEAGUE_DEF_REF, league_pace_mean)
-ORB_adj = (league_dreb_pct_mean / opp_dreb_pct) if np.isfinite(league_dreb_pct_mean) and np.isfinite(opp_dreb_pct) and opp_dreb_pct > 0 else 1.0
-DRB_adj = (league_oreb_mean / opp_oreb)       if np.isfinite(league_oreb_mean)     and np.isfinite(opp_oreb)     and opp_oreb > 0         else 1.0
+# Derived multipliers (pace & profile). Keep robust defaults if missing.
+pace_factor = (opp_pace / league_pace_mean) if (np.isfinite(opp_pace) and league_pace_mean > 0) else 1.0
+m_3pa = (opp_fg3a / L_OPP_FG3A) if (np.isfinite(opp_fg3a) and L_OPP_FG3A > 0) else 1.0
+m_2pa = (opp_2pa  / L_OPP_2PA)  if (np.isfinite(opp_2pa)  and L_OPP_2PA  > 0) else 1.0
+m_fta = (opp_fta  / L_OPP_FTA)  if (np.isfinite(opp_fta)  and L_OPP_FTA  > 0) else 1.0
+# Rebound logic: More OPP_DREB (opponents grabbing DREB vs them) => harder to get OREB → inverse scale
+m_oreb = (L_OPP_DREB / opp_dreb) if (np.isfinite(opp_dreb) and opp_dreb > 0) else 1.0
+# More OPP_OREB allowed → more DREB chances for us → direct scale
+m_dreb = (opp_oreb / L_OPP_OREB) if (np.isfinite(opp_oreb) and L_OPP_OREB > 0) else 1.0
+# Assists allowed profile (optional, gentle)
+m_ast = (opp_opp_ast / L_OPP_AST) if (np.isfinite(opp_opp_ast) and L_OPP_AST > 0) else 1.0
 
 # ----------------------- Player header (Age • Position • Seasons • GP) -----------------------
-left, right = st.columns([2, 1.4])  # slightly wider right pane for readability
+left, right = st.columns([2, 1])
 with left:
     st.subheader(f"{player_name} — {season_used}")
     age = pos = exp = None
     if not cpi.empty:
-        if "AGE" in cpi.columns and len(cpi["AGE"]) > 0:
-            age = cpi["AGE"].iloc[0]
-        if "POSITION" in cpi.columns and len(cpi["POSITION"]) > 0:
-            pos = cpi["POSITION"].iloc[0] or None
-        if "SEASON_EXP" in cpi.columns and len(cpi["SEASON_EXP"]) > 0:
-            exp = cpi["SEASON_EXP"].iloc[0]
+        age = cpi.get("AGE", pd.Series([None])).iloc[0] if "AGE" in cpi.columns else None
+        pos = cpi.get("POSITION", pd.Series([None])).iloc[0] if "POSITION" in cpi.columns else None
+        exp = cpi.get("SEASON_EXP", pd.Series([None])).iloc[0] if "SEASON_EXP" in cpi.columns else None
     gp_this_season = int(len(logs))
     meta = []
     if age is not None and str(age) != "nan":
-        try: meta.append(f"Age: {int(float(age))}")
-        except: pass
-    meta.append(f"Position: {pos if pos else '—'}")
+        meta.append(f"Age: {int(float(age))}")
+    if pos:
+        meta.append(f"Position: {pos}")
     if exp is not None and str(exp) != "nan":
-        try: meta.append(f"Seasons: {int(float(exp))}")
-        except: meta.append(f"Seasons: —")
-    else:
-        meta.append("Seasons: —")
+        meta.append(f"Seasons: {int(float(exp))}")
     meta.append(f"GP ({season_used}): {gp_this_season}")
     st.caption(" • ".join(meta))
 
 with right:
     st.markdown(f"**Opponent: {opponent}**")
-
-    # Centered, responsive stat cards with smaller italic rank
-    CARD_CSS = """
-    <style>
-      .statgrid {display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px;}
-      @media (max-width: 1100px) { .statgrid {grid-template-columns: 1fr;} }
-      .statcard {
-        border:1px solid #e6e6e6; border-radius:12px; padding:10px 12px;
-        box-sizing:border-box; text-align:center;
-      }
-      .statcard .title { font-weight:600; font-size:0.95rem; margin-bottom:4px; text-align:center; }
-      .statcard .value { display:flex; align-items:baseline; justify-content:center; gap:6px; flex-wrap:wrap; }
-      .statcard .value .num { font-size:1.25rem; line-height:1.6rem; }
-      .statcard .value .rank { font-size:0.95rem; font-style:italic; opacity:0.85; }
-    </style>
-    """
-    st.markdown(CARD_CSS, unsafe_allow_html=True)
-
-    def stat_card(title: str, value, rank):
-        if value is None or (isinstance(value, float) and not np.isfinite(value)):
-            num_html = "—"
-            rank_html = ""
-        else:
-            num_html = f"{value:.1f}"
-            rank_html = f"<span class='rank'>({ordinal(rank)})</span>" if rank else ""
-        st.markdown(
-            f"""
-            <div class="statcard">
-              <div class="title">{title}</div>
-              <div class="value"><span class="num">{num_html}</span>{rank_html}</div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-    st.markdown('<div class="statgrid">', unsafe_allow_html=True)
-    stat_card("DEF Rating", opp_def, rank_def)
-    stat_card("Points Allowed", opp_pts_allow, rank_pa)
-    stat_card("Pace", opp_pace, rank_pace)
-    st.markdown('</div>', unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    c1.metric("DEF Rating", f"{opp_def:.1f}")
+    c2.metric("Pace", f"{opp_pace:.1f}")
 
 # ----------------------- Baselines & blends -----------------------
-def _series_head(s: pd.Series, n_opt):
-    return s if n_opt is None else s.head(n_opt)
-
-def mean_recent(series, n_opt=n_recent):
+def mean_recent(series, n=n_recent):
     s = pd.to_numeric(series, errors="coerce").dropna()
-    if not len(s):
-        return np.nan
-    if n_opt is None:
-        return float(s.mean())
-    return float(s.iloc[:min(n_opt, len(s))].mean())
+    return float(s.iloc[:min(n, len(s))].mean()) if len(s) else np.nan
 
 def season_mean(series):
     s = pd.to_numeric(series, errors="coerce").dropna()
     return float(s.mean()) if len(s) else np.nan
 
-# Minutes: blend of recent/season/career (improved minute projection)
-MIN_recent = mean_recent(logs["MIN"], n_recent)
-MIN_season = season_mean(logs["MIN"])
-MIN_career_pg = career_pg_counting_stat(career_raw, "MIN")
+# Minutes (new simple/robust version)
+MIN_proj = project_minutes_simple(logs, career_raw, w_recent, w_season, w_career)
 
-def blend_vals_local(r, s, c):
-    total = max(w_recent + w_season + w_career, 1e-9)
-    return (w_recent/total)*(r if np.isfinite(r) else 0.0) + \
-           (w_season/total)*(s if np.isfinite(s) else 0.0) + \
-           (w_career/total)*(c if np.isfinite(c) else 0.0)
-
-MIN_proj = blend_vals_local(MIN_recent, MIN_season, MIN_career_pg)
-
-FG2A_per_min_recent = pm_ratio(_series_head(logs["FG2A"], n_recent), _series_head(logs["MIN"], n_recent))
-FG3A_per_min_recent = pm_ratio(_series_head(logs["FG3A"], n_recent), _series_head(logs["MIN"], n_recent))
-FTA_per_min_recent  = pm_ratio(_series_head(logs["FTA"],  n_recent), _series_head(logs["MIN"], n_recent))
+# --- Per-minute rates: recent/season/career blends (unchanged logic) ---
+FG2A_per_min_recent = pm_ratio(logs["FG2A"].head(n_recent), logs["MIN"].head(n_recent))
+FG3A_per_min_recent = pm_ratio(logs["FG3A"].head(n_recent), logs["MIN"].head(n_recent))
+FTA_per_min_recent  = pm_ratio(logs["FTA"].head(n_recent),  logs["MIN"].head(n_recent))
 
 FG2A_per_min_season = pm_ratio(logs["FG2A"], logs["MIN"])
 FG3A_per_min_season = pm_ratio(logs["FG3A"], logs["MIN"])
 FTA_per_min_season  = pm_ratio(logs["FTA"],  logs["MIN"])
 
 FG2A_career_pg = safe_div((career_pg_counting_stat(career_raw, "FGA") - career_pg_counting_stat(career_raw, "FG3A")), 1.0)
-FG3A_career_pg = career_pg_counting_stat(career_raw, "FG3M") if "FG3M" in career_raw.columns else career_pg_counting_stat(career_raw, "FG3A")
+FG3A_career_pg = career_pg_counting_stat(career_raw, "FG3A")
 FTA_career_pg  = career_pg_counting_stat(career_raw, "FTA")
+MIN_career_pg  = career_pg_counting_stat(career_raw, "MIN")
 
 FG2A_per_min_career = safe_div(FG2A_career_pg, MIN_career_pg)
 FG3A_per_min_career = safe_div(FG3A_career_pg, MIN_career_pg)
 FTA_per_min_career  = safe_div(FTA_career_pg,  MIN_career_pg)
 
-def pct(series_m, series_a, n_opt=None):
+def pct(series_m, series_a, n=None):
     m = pd.to_numeric(series_m, errors="coerce")
     a = pd.to_numeric(series_a, errors="coerce")
-    if n_opt is not None:
-        m, a = m.head(n_opt), a.head(n_opt)
+    if n is not None:
+        m, a = m.head(n), a.head(n)
     mask = a > 0
     return float((m[mask] / a[mask]).mean()) if mask.any() else np.nan
 
@@ -572,66 +489,110 @@ ORB_per_min_career = safe_div(ORB_career_pg, MIN_career_pg)
 DRB_per_min_career = safe_div(DRB_career_pg, MIN_career_pg)
 AST_per_min_career = safe_div(AST_career_pg, MIN_career_pg)
 
-def blend_vals(r, s, c):
-    return blend_vals_local(r, s, c)
+def blend_vals_local(r, s, c):
+    total = max(w_recent + w_season + w_career, 1e-9)
+    return (w_recent/total)*r + (w_season/total)*s + (w_career/total)*c
 
-FG2A_per_min_blend = blend_vals(FG2A_per_min_recent, FG2A_per_min_season, FG2A_per_min_career)
-FG3A_per_min_blend = blend_vals(FG3A_per_min_recent, FG3A_per_min_season, FG3A_per_min_career)
-FTA_per_min_blend  = blend_vals(FTA_per_min_recent,  FTA_per_min_season,  FTA_per_min_career)
+FG2A_per_min_blend = blend_vals_local(FG2A_per_min_recent, FG2A_per_min_season, FG2A_per_min_career)
+FG3A_per_min_blend = blend_vals_local(FG3A_per_min_recent, FG3A_per_min_season, FG3A_per_min_career)
+FTA_per_min_blend  = blend_vals_local(FTA_per_min_recent,  FTA_per_min_season,  FTA_per_min_career)
 
-FG2_PCT_blend = blend_vals(FG2_PCT_recent, FG2_PCT_season, FG2_PCT_career)
-FG3_PCT_blend = blend_vals(FG3_PCT_recent, FG3_PCT_season, FG3_PCT_career)
-FT_PCT_blend  = blend_vals(FT_PCT_recent,  FT_PCT_season,  FT_PCT_career)
+FG2_PCT_blend = blend_vals_local(FG2_PCT_recent, FG2_PCT_season, FG2_PCT_career)
+FG3_PCT_blend = blend_vals_local(FG3_PCT_recent, FG3_PCT_season, FG3_PCT_career)
+FT_PCT_blend  = blend_vals_local(FT_PCT_recent,  FT_PCT_season,  FT_PCT_career)
 
-FG2A_proj = max(0.0, (FG2A_per_min_blend * MIN_proj) * AdjFactor) if np.isfinite(FG2A_per_min_blend) else 0.0
-FG3A_proj = max(0.0, (FG3A_per_min_blend * MIN_proj) * AdjFactor) if np.isfinite(FG3A_per_min_blend) else 0.0
-FTA_proj  = max(0.0, (FTA_per_min_blend  * MIN_proj) * AdjFactor) if np.isfinite(FTA_per_min_blend)  else 0.0
+ORB_per_min_blend = blend_vals_local(ORB_per_min_recent, ORB_per_min_season, ORB_per_min_career)
+DRB_per_min_blend = blend_vals_local(DRB_per_min_recent, DRB_per_min_season, DRB_per_min_career)
+AST_per_min_blend = blend_vals_local(AST_per_min_recent, AST_per_min_season, AST_per_min_career)
+
+# ---------- NEW: Component-level opponent + pace adjustments on PER-MIN rates ----------
+FG2A_per_min_adj = (FG2A_per_min_blend or 0.0) * pace_factor * m_2pa
+FG3A_per_min_adj = (FG3A_per_min_blend or 0.0) * pace_factor * m_3pa
+FTA_per_min_adj  = (FTA_per_min_blend  or 0.0) * pace_factor * m_fta
+
+ORB_per_min_adj  = (ORB_per_min_blend or 0.0) * pace_factor * m_oreb
+DRB_per_min_adj  = (DRB_per_min_blend or 0.0) * pace_factor * m_dreb
+AST_per_min_adj  = (AST_per_min_blend or 0.0) * pace_factor * m_ast
+
+# ---------- Projected totals ----------
+FG2A_proj = max(0.0, FG2A_per_min_adj * MIN_proj) if np.isfinite(FG2A_per_min_adj) else 0.0
+FG3A_proj = max(0.0, FG3A_per_min_adj * MIN_proj) if np.isfinite(FG3A_per_min_adj) else 0.0
+FTA_proj  = max(0.0, FTA_per_min_adj  * MIN_proj) if np.isfinite(FTA_per_min_adj)  else 0.0
 
 FG2M_proj = FG2A_proj * float(np.clip(FG2_PCT_blend if np.isfinite(FG2_PCT_blend) else 0.5, 0, 1))
 FG3M_proj = FG3A_proj * float(np.clip(FG3_PCT_blend if np.isfinite(FG3_PCT_blend) else 0.35, 0, 1))
 FTM_proj  = FTA_proj  * float(np.clip(FT_PCT_blend  if np.isfinite(FT_PCT_blend)  else 0.78, 0, 1))
+PTS_proj  = 2.0*FG2M_proj + 3.0*FG3M_proj + 1.0*FTM_proj
 
-PTS_proj = 2.0*FG2M_proj + 3.0*FG3M_proj + 1.0*FTM_proj
-
-ORB_per_min_blend = blend_vals(ORB_per_min_recent, ORB_per_min_season, ORB_per_min_career)
-DRB_per_min_blend = blend_vals(DRB_per_min_recent, DRB_per_min_season, DRB_per_min_career)
-
-ORB_proj = max(0.0, (ORB_per_min_blend * MIN_proj) * AdjFactor * ORB_adj) if np.isfinite(ORB_per_min_blend) else 0.0
-DRB_proj = max(0.0, (DRB_per_min_blend * MIN_proj) * AdjFactor * DRB_adj) if np.isfinite(DRB_per_min_blend) else 0.0
+ORB_proj = max(0.0, ORB_per_min_adj * MIN_proj) if np.isfinite(ORB_per_min_adj) else 0.0
+DRB_proj = max(0.0, DRB_per_min_adj * MIN_proj) if np.isfinite(DRB_per_min_adj) else 0.0
 REB_proj = ORB_proj + DRB_proj
 
-AST_per_min_blend = blend_vals(AST_per_min_recent, AST_per_min_season, AST_per_min_career)
-AST_proj = max(0.0, (AST_per_min_blend * MIN_proj) * AdjFactor) if np.isfinite(AST_per_min_blend) else 0.0
-
+AST_proj = max(0.0, AST_per_min_adj * MIN_proj) if np.isfinite(AST_per_min_adj) else 0.0
 PRA_proj = PTS_proj + REB_proj + AST_proj
+
+# ---------- NEW: Tight central range (45th–55th pct) via light bootstrap ----------
+def _bootstrap_ranges(n_sims=400):
+    rng = np.random.default_rng(42)
+    mins = max(0.0, float(MIN_proj))
+
+    # attempts (Poisson), makes (Binomial), counts (Poisson)
+    lam_2pa = max(0.0, FG2A_per_min_adj * mins)
+    lam_3pa = max(0.0, FG3A_per_min_adj * mins)
+    lam_fta = max(0.0, FTA_per_min_adj  * mins)
+
+    p2 = float(np.clip(FG2_PCT_blend if np.isfinite(FG2_PCT_blend) else 0.5,  0, 1))
+    p3 = float(np.clip(FG3_PCT_blend if np.isfinite(FG3_PCT_blend) else 0.35, 0, 1))
+    pft= float(np.clip(FT_PCT_blend  if np.isfinite(FT_PCT_blend)  else 0.78, 0, 1))
+
+    lam_oreb = max(0.0, ORB_per_min_adj * mins)
+    lam_dreb = max(0.0, DRB_per_min_adj * mins)
+    lam_ast  = max(0.0, AST_per_min_adj * mins)
+
+    PTS, REB, AST, PRA = [], [], [], []
+    for _ in range(n_sims):
+        a2 = rng.poisson(lam_2pa); m2 = rng.binomial(a2, p2)
+        a3 = rng.poisson(lam_3pa); m3 = rng.binomial(a3, p3)
+        af = rng.poisson(lam_fta); mf = rng.binomial(af, pft)
+        orr= rng.poisson(lam_oreb); drr= rng.poisson(lam_dreb)
+        ast= rng.poisson(lam_ast)
+
+        pts = 2*m2 + 3*m3 + mf
+        reb = orr + drr
+        pra = pts + reb + ast
+
+        PTS.append(pts); REB.append(reb); AST.append(ast); PRA.append(pra)
+
+    def band(v):
+        lo = float(np.percentile(v, 45))
+        hi = float(np.percentile(v, 55))
+        return lo, hi
+
+    return band(PTS), band(REB), band(AST), band(PRA)
+
+pts_band, reb_band, ast_band, pra_band = _bootstrap_ranges()
+def _fmt_band(b): return f"{b[0]:.1f}–{b[1]:.1f}"
 
 # ----------------------- KPI Row -----------------------
 kpi_stats = ["PTS","REB","AST","MIN"]
-recent_mean = (_series_head(logs[kpi_stats], n_recent)).mean(numeric_only=True)
+recent_mean = logs[kpi_stats].head(n_recent).mean(numeric_only=True)
 season_mean_vals = logs[kpi_stats].mean(numeric_only=True)
 cols = st.columns(len(kpi_stats))
 for i, s in enumerate(kpi_stats):
     if s not in logs.columns and s != "MIN":
         continue
-    fs = form_score(_series_head(logs[s], n_recent) if s in logs.columns else logs.get(s, pd.Series(dtype=float)), k=n_recent if n_recent else 5)
+    fs = form_score(logs[s], k=n_recent) if s in logs.columns else 50.0
     delta = (recent_mean.get(s, np.nan) - season_mean_vals.get(s, np.nan)) if s in recent_mean.index else np.nan
-    label = f"{s} ({'Season' if n_recent is None else f'L{n_recent}'})"
     cols[i].metric(
-        label=label,
+        label=f"{s} (L{n_recent})",
         value=f"{recent_mean.get(s, np.nan):.1f}" if np.isfinite(recent_mean.get(s, np.nan)) else "—",
         delta=f"{delta:+.1f} vs SZN • Form {int(fs)}" if np.isfinite(delta) else f"Form {int(fs)}"
     )
 
 # ----------------------- Recent Trends -----------------------
-if n_recent is None:
-    st.markdown("### Season Trends")
-    trend_n = len(logs)
-else:
-    st.markdown(f"### Recent Trends (Last {n_recent} Games)")
-    trend_n = n_recent
-
+st.markdown("### Recent Trends (Last 20 Games)")
 trend_cols = [c for c in ["MIN","PTS","REB","AST","PRA","FG3M"] if c in logs.columns]
-trend_df = logs[["GAME_DATE"] + trend_cols].head(trend_n).sort_values("GAME_DATE")
+trend_df = logs[["GAME_DATE"] + trend_cols].head(20).sort_values("GAME_DATE")
 for s in trend_cols:
     chart = (
         alt.Chart(trend_df)
@@ -649,19 +610,20 @@ pts_block = pd.DataFrame({
 }).round(2)
 st.dataframe(pts_block.style.format({"Value": "{:.2f}"}), use_container_width=True, height=_auto_height(pts_block))
 
-# ----------------------- Projection Summary (normal rows; no highlight) -----------------------
+# ----------------------- Projection Summary (order + bold PRA & 3PM) -----------------------
 st.markdown("### Projection Summary")
 out = pd.DataFrame({
     "Stat": ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"],
-    "Proj": [MIN_proj, PTS_proj, REB_proj, AST_proj, PRA_proj, FG2M_proj, FG2A_proj, FG3M_proj, FG3A_proj, ORB_proj, DRB_proj]
+    "Proj": [MIN_proj, PTS_proj, REB_proj, AST_proj, PRA_proj, FG2M_proj, FG2A_proj, FG3M_proj, FG3A_proj, ORB_proj, DRB_proj],
+    "Range (45–55%)": ["—", _fmt_band(pts_band), _fmt_band(reb_band), _fmt_band(ast_band), _fmt_band(pra_band), "—","—","—","—","—","—"],
 })
 out = out.round(2)
 summary_indexed = out.set_index("Stat")
-render_summary_table(summary_indexed)
+render_summary_table(summary_indexed, highlight_rows={"PRA","3PM"})
 
 # ----------------------- Compare Windows (Career vs Season vs L5/L10/L20) -----------------------
 st.markdown("### Compare Windows (Career vs Season vs L5/L10/L20)")
-kpi_existing = [c for c in ["PTS","REB","AST","MIN","FG3M"] if c in logs.columns]
+kpi_existing = [c for c in ["PTS","REB","AST","MIN"] if c in logs.columns]
 L5  = window_avg(logs, 5,  kpi_existing)
 L10 = window_avg(logs, 10, kpi_existing)
 L20 = window_avg(logs, 20, kpi_existing)
@@ -672,7 +634,6 @@ career_pg = {
     "REB": career_pg_counting_stat(career_raw, "REB"),
     "AST": career_pg_counting_stat(career_raw, "AST"),
     "MIN": career_pg_counting_stat(career_raw, "MIN"),
-    "FG3M": career_pg_counting_stat(career_raw, "FG3M"),
 }
 cmp_df = pd.concat(
     {"Career": pd.Series(career_pg),
@@ -697,31 +658,20 @@ if "PRA" not in last5.columns:
 display_last5 = last5[recent_cols].rename(columns={
     "FG2M":"2PM","FG2A":"2PA","FG3M":"3PM","FG3A":"3PA"
 })
-
 int_cols = [c for c in ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in display_last5.columns]
 fmt_map = {c: "{:.0f}" for c in int_cols}
-
-st.dataframe(
-    display_last5.style.format(fmt_map),
-    use_container_width=True,
-    height=_auto_height(display_last5)
-)
+st.dataframe(display_last5.style.format(fmt_map), use_container_width=True, height=_auto_height(display_last5))
 
 avg_cols = [c for c in ["MIN","PTS","REB","AST","PRA","2PM","2PA","3PM","3PA","OREB","DREB"] if c in display_last5.columns]
 avg_last5 = display_last5[avg_cols].mean(numeric_only=True).to_frame().T.round(2)
 avg_last5.index = ["Average (Last 5)"]
-st.dataframe(
-    avg_last5.style.format("{:.2f}"),
-    use_container_width=True,
-    height=_auto_height(avg_last5)
-)
+st.dataframe(avg_last5.style.format("{:.2f}"), use_container_width=True, height=_auto_height(avg_last5))
 
 # ----------------------- Last 5 vs {opponent} — Most Recent Seasons -----------------------
 st.markdown(f"### Last 5 vs {opponent} — Most Recent Seasons")
 ts = teams_static_df.rename(columns={"id":"TEAM_ID", "full_name":"TEAM_NAME", "abbreviation":"TEAM_ABBR"})
 match = ts.loc[ts["TEAM_NAME"].str.lower() == opponent.lower()]
 opp_abbr = match["TEAM_ABBR"].iloc[0] if not match.empty else opponent[:3].upper()
-opp_abbr = opp_abbr.upper()
 
 vs5 = last_n_vs_opponent(player_id, opp_abbr, SEASONS, n=5)
 if vs5.empty:
@@ -739,24 +689,10 @@ else:
     int_cols_vs = [c for c in stat_cols if c in vs5_display.columns]
     fmt_map_vs = {c: "{:.0f}" for c in int_cols_vs}
 
-    st.dataframe(
-        vs5_display.style.format(fmt_map_vs),
-        use_container_width=True,
-        height=_auto_height(vs5_display)
-    )
+    st.dataframe(vs5_display.style.format(fmt_map_vs), use_container_width=True, height=_auto_height(vs5_display))
 
     avg_vs = vs5_display[int_cols_vs].mean(numeric_only=True).to_frame().T.round(2)
     avg_vs.index = ["Average (vs Opp)"]
-    st.dataframe(
-        avg_vs.style.format("{:.2f}"),
-        use_container_width=True,
-        height=_auto_height(avg_vs)
-    )
+    st.dataframe(avg_vs.style.format("{:.2f}"), use_container_width=True, height=_auto_height(avg_vs))
 
-st.caption(
-    "Notes: Opponent context pulls DEF Rating & Pace from Advanced team stats, and Points Allowed from Opponent team stats — "
-    "all Regular Season only and restricted to post–regular-season start date to avoid preseason bleed. Tables auto-size with "
-    "two-decimal formatting. Career values use per-game from season totals (sum totals / sum GP). If current-season logs are not "
-    "available, the app falls back to the most recent season with data. Rookies are limited to their available season. Trend lines "
-    "follow the selected window (or Season)."
-)
+st.caption("Notes: Opponent multipliers (3PA/2PA/FTA/REB/AST) are normalized vs league and applied to per-minute rates, with pace affecting attempts only. Minutes are projected via a robust, recent-weighted method. Ranges show the tight 45–55th percentile from a light bootstrap. Career values use proper per-game aggregation from season totals.")
