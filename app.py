@@ -1,8 +1,4 @@
-# app.py — Original structure preserved with 3 targeted upgrades:
-# (1) Rookie inclusion in player list
-# (2) Advanced + Opponent team context
-# (3) Smarter opponent adjustment (uses OPP_PTS/REB gently)
-
+# app.py
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -104,16 +100,17 @@ def career_pg_counting_stat(career_df: pd.DataFrame, col: str) -> float:
         return np.nan
     return float(s_tot[mask].sum() / s_gp[mask].sum())
 
-# Helper for clean numeric-only styling in tables
+# ---------- NEW: tiny helpers to render dataframes neatly ----------
 def _auto_height(df: pd.DataFrame, row_px: int = 34, header_px: int = 38, max_px: int = 900) -> int:
+    """Compute a height that fits all rows to avoid vertical scroll in st.dataframe."""
     rows = max(len(df), 1)
     return min(max_px, header_px + row_px * rows + 8)
 
 def render_summary_table(df_indexed: pd.DataFrame):
-    num_cols = df_indexed.select_dtypes(include=[np.number]).columns
-    fmt_map = {c: "{:.2f}" for c in num_cols}
+    """Format to 2 decimals and render with a height that avoids vertical scrolling."""
+    styler = df_indexed.style.format("{:.2f}")
     h = _auto_height(df_indexed)
-    st.dataframe(df_indexed.style.format(fmt_map), use_container_width=True, height=h)
+    st.dataframe(styler, use_container_width=True, height=h)
 
 # ----------------------- Season detection & caching -----------------------
 @st.cache_data(ttl=6*3600)
@@ -132,29 +129,17 @@ def detect_available_seasons(max_back_years: int = 12) -> list[str]:
             pass
     return available
 
-# ----------------------- (1) Improved: Active players + rookies -----------------------
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_active_players_df():
-    df = pd.DataFrame(static_players.get_active_players())
-    # Add rookie placeholders if not present in static list yet
-    rookies = [
-        {"id": 999901, "full_name": "Cooper Flagg"},
-        {"id": 999902, "full_name": "Dylan Harper"},
-        {"id": 999903, "full_name": "Hugo Gonzalez"},
-    ]
-    for r in rookies:
-        if not df["full_name"].str.contains(r["full_name"], case=False, na=False).any():
-            df = pd.concat([df, pd.DataFrame([r])], ignore_index=True)
-    return df
+    return pd.DataFrame(static_players.get_active_players())
 
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_teams_static_df():
     return pd.DataFrame(static_teams.get_teams())
 
-# ----------------------- (2) Improved: Team metrics with Advanced + Opponent -----------------------
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_team_tables(season: str):
-    # Defense slice (DEF_RATING / DREB_PCT – same as your original)
+    # Defense slice (provides DEF_RATING and DREB_PCT)
     df_def_all = leaguedashteamstats.LeagueDashTeamStats(
         season=season, per_mode_detailed="PerGame", measure_type_detailed_defense="Defense"
     ).get_data_frames()[0]
@@ -163,36 +148,16 @@ def get_team_tables(season: str):
         season=season, per_mode_detailed="PerGame"
     ).get_data_frames()[0]
 
-    # Advanced slice: PACE, OFF/DEF/NET_RATING (best-effort)
-    try:
-        df_adv_all = leaguedashteamstats.LeagueDashTeamStats(
-            season=season, measure_type_detailed_defense="Advanced", per_mode_detailed="PerGame"
-        ).get_data_frames()[0]
-    except Exception:
-        df_adv_all = pd.DataFrame()
-
-    # Opponent slice: OPP_* box-counting allowed (best-effort)
-    try:
-        df_opp_all = leaguedashteamstats.LeagueDashTeamStats(
-            season=season, measure_type_detailed_defense="Opponent", per_mode_detailed="PerGame"
-        ).get_data_frames()[0]
-    except Exception:
-        df_opp_all = pd.DataFrame()
-
-    def _f(df): return df[df["TEAM_ID"].apply(is_nba_team_id)].copy() if not df.empty else df
-    df_def, df_base, df_adv, df_opp = map(_f, [df_def_all, df_base_all, df_adv_all, df_opp_all])
+    # Keep NBA teams only
+    df_def  = df_def_all[df_def_all["TEAM_ID"].apply(is_nba_team_id)].copy()
+    df_base = df_base_all[df_base_all["TEAM_ID"].apply(is_nba_team_id)].copy()
 
     keep_def  = ["TEAM_ID","TEAM_NAME","DEF_RATING","DREB_PCT"]
     keep_base = ["TEAM_ID","TEAM_NAME","MIN","FGA","FTA","OREB","TOV"]
-    keep_adv  = ["TEAM_ID","TEAM_NAME","PACE","NET_RATING","OFF_RATING","DEF_RATING"]
-    keep_opp  = ["TEAM_ID","TEAM_NAME","OPP_PTS","OPP_REB","OPP_AST","OPP_FG3M","OPP_FG3A"]
+    df_def  = df_def[keep_def].copy()
+    df_base = df_base[keep_base].copy()
 
-    for frame, keep in zip([df_def, df_base, df_adv, df_opp], [keep_def, keep_base, keep_adv, keep_opp]):
-        for c in keep:
-            if c not in frame.columns:
-                frame[c] = np.nan
-
-    # Pace proxy & league means (unchanged)
+    # Pace proxy & league means
     df_base["PACE_PROXY"] = df_base.apply(pace_proxy_row, axis=1)
     league_pace_mean = float(df_base["PACE_PROXY"].mean())
     league_dreb_pct_mean = float(df_def["DREB_PCT"].mean()) if "DREB_PCT" in df_def.columns else np.nan
@@ -200,14 +165,11 @@ def get_team_tables(season: str):
 
     teams_ctx = (
         df_def.merge(df_base[["TEAM_ID","PACE_PROXY","OREB"]], on="TEAM_ID", how="left")
-              .merge(df_adv, on=["TEAM_ID","TEAM_NAME"], how="left", suffixes=("","_ADV"))
-              .merge(df_opp, on=["TEAM_ID","TEAM_NAME"], how="left", suffixes=("","_OPP"))
               .sort_values("TEAM_NAME")
               .reset_index(drop=True)
     )
     return teams_ctx, league_pace_mean, league_dreb_pct_mean, league_oreb_mean
 
-# ----------------------- Data fetchers (unchanged) -----------------------
 @st.cache_data(ttl=CACHE_HOURS*3600)
 def get_player_logs(player_id: int, season: str):
     df = playergamelog.PlayerGameLog(player_id=player_id, season=season).get_data_frames()[0]
@@ -317,20 +279,8 @@ opp_def      = float(opp_row["DEF_RATING"])
 opp_pace     = float(opp_row["PACE_PROXY"])
 opp_dreb_pct = float(opp_row["DREB_PCT"]) if "DREB_PCT" in teams_ctx.columns else np.nan
 opp_oreb     = float(opp_row["OREB"])
-# (3) Gentle scaling using opponent allowed points/rebounds if available
-opp_pts_allowed = float(opp_row.get("OPP_PTS", np.nan))
-opp_reb_allowed = float(opp_row.get("OPP_REB", np.nan))
 
-pts_factor = 1.0
-reb_factor = 1.0
-if np.isfinite(opp_pts_allowed):
-    # scale to a coarse league baseline ~112
-    pts_factor = (112.0 / max(opp_pts_allowed, 1e-9))
-if np.isfinite(opp_reb_allowed):
-    # scale to a coarse baseline for team rebounds allowed ~44
-    reb_factor = (44.0 / max(opp_reb_allowed, 1e-9))
-
-AdjFactor = opponent_adjustment(opp_def, opp_pace, LEAGUE_DEF_REF, league_pace_mean) * float(np.sqrt(pts_factor * reb_factor))
+AdjFactor = opponent_adjustment(opp_def, opp_pace, LEAGUE_DEF_REF, league_pace_mean)
 ORB_adj = (league_dreb_pct_mean / opp_dreb_pct) if np.isfinite(league_dreb_pct_mean) and np.isfinite(opp_dreb_pct) and opp_dreb_pct > 0 else 1.0
 DRB_adj = (league_oreb_mean / opp_oreb)       if np.isfinite(league_oreb_mean)     and np.isfinite(opp_oreb)     and opp_oreb > 0         else 1.0
 
@@ -338,16 +288,13 @@ DRB_adj = (league_oreb_mean / opp_oreb)       if np.isfinite(league_oreb_mean)  
 left, right = st.columns([2, 1])
 with left:
     st.subheader(f"{player_name} — {season_used}")
-    age = pos = exp = team_name = None
+    age = pos = exp = None
     if not cpi.empty:
         age = cpi.get("AGE", pd.Series([None])).iloc[0] if "AGE" in cpi.columns else None
         pos = cpi.get("POSITION", pd.Series([None])).iloc[0] if "POSITION" in cpi.columns else None
         exp = cpi.get("SEASON_EXP", pd.Series([None])).iloc[0] if "SEASON_EXP" in cpi.columns else None
-        team_name = cpi.get("TEAM_NAME", pd.Series([None])).iloc[0] if "TEAM_NAME" in cpi.columns else None
     gp_this_season = int(len(logs))
     meta = []
-    if team_name:
-        meta.append(f"Team: {team_name}")
     if age is not None and str(age) != "nan":
         meta.append(f"Age: {int(float(age))}")
     if pos:
@@ -363,7 +310,7 @@ with right:
     c1.metric("DEF Rating", f"{opp_def:.1f}")
     c2.metric("Pace (proxy)", f"{opp_pace:.1f}")
 
-# ----------------------- Baselines & blends (unchanged) -----------------------
+# ----------------------- Baselines & blends -----------------------
 def mean_recent(series, n=n_recent):
     s = pd.to_numeric(series, errors="coerce").dropna()
     if n == "Season":
