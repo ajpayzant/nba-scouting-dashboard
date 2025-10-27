@@ -4,7 +4,8 @@
 # - Opponent-specific last-5 box scores via LeagueGameFinder (all seasons)
 # - Sidebar: Season, Player search, Recency; auto-load (no button)
 # - NBA-only teams (filters out WNBA/G-League by TEAM_ID prefix)
-# - UPDATED Compare Windows: Career, Previous Season, Current Season, Last 5, Last 20 (MIN, PTS, REB, AST, 3PM)
+# - Compare Windows: Career, Previous Season, Current Season, Last 5, Last 20 (MIN, PTS, REB, AST, 3PM)
+# - NEW: Average row appended to "Last 5 Games" and "Last 5 vs Opponent" tables
 
 import time
 import datetime
@@ -107,6 +108,28 @@ def format_record(w, l):
         return f"{int(w)}–{int(l)}"
     except Exception:
         return "—"
+
+def append_average_row(df: pd.DataFrame, label: str = "Average") -> pd.DataFrame:
+    """Append an 'Average' row to the end of a box score table (mean over numeric cols)."""
+    out = df.copy()
+    if out.empty:
+        return out
+    num_cols = out.select_dtypes(include=[np.number]).columns.tolist()
+    if not num_cols:
+        return out
+    avg_vals = out[num_cols].mean(numeric_only=True)
+    avg_row = {c: np.nan for c in out.columns}
+    for c in num_cols:
+        avg_row[c] = float(avg_vals.get(c, np.nan))
+    # Set identifiers to a clean label
+    if "GAME_DATE" in out.columns:
+        avg_row["GAME_DATE"] = pd.NaT
+    if "MATCHUP" in out.columns:
+        avg_row["MATCHUP"] = label
+    if "WL" in out.columns:
+        avg_row["WL"] = ""
+    out = pd.concat([out, pd.DataFrame([avg_row])], ignore_index=True)
+    return out
 
 # --- Opponent abbrev & TEAM_ID resolution (for fallback and GameFinder) ---
 def _build_static_maps():
@@ -568,7 +591,9 @@ st.markdown("### Last 5 Games")
 cols_base = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
 last5 = logs[cols_base].head(5).copy()
 last5 = add_shot_breakouts(last5)
-num_fmt = {c: "{:.0f}" for c in last5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
+# Append average row
+last5 = append_average_row(last5, label="Average (Last 5)")
+num_fmt = {c: "{:.1f}" for c in last5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
 st.dataframe(last5.style.format(num_fmt), use_container_width=True, height=_auto_height(last5))
 
 # ----------------------- Last 5 vs Opponent (All Seasons) -----------------------
@@ -606,7 +631,9 @@ if vs_opp_df.empty:
     st.info(f"No historical games vs {opponent}.")
 else:
     vs_opp5 = add_shot_breakouts(vs_opp_df.sort_values("GAME_DATE", ascending=False).head(5).copy())
-    num_fmt2 = {c: "{:.0f}" for c in vs_opp5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
+    # Append average row
+    vs_opp5 = append_average_row(vs_opp5, label="Average (Last 5 vs Opp)")
+    num_fmt2 = {c: "{:.1f}" for c in vs_opp5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
     st.dataframe(vs_opp5.style.format(num_fmt2), use_container_width=True, height=_auto_height(vs_opp5))
 
 # ----------------------- Projections (hidden) -----------------------
@@ -629,4 +656,4 @@ with st.expander("Projection Summary (beta – hidden until finalized)"):
             st.info(f"Projection temporarily unavailable: {e}")
 
 # ----------------------- Footer -----------------------
-st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). MIN reflects totals from Base (Totals); PACE/ratings from Advanced (PerGame). Opponent last-5 uses LeagueGameFinder with a robust fallback.")
+st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). MIN reflects totals from Base (Totals); PACE/ratings from Advanced (PerGame). Opponent last-5 uses LeagueGameFinder with a robust fallback. Average rows are computed over the shown 5 games.")
