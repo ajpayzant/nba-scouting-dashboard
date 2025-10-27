@@ -1,7 +1,7 @@
 # requirements.txt
-streamlit==1.33.0
-pandas==2.2.2
-numpy==1.26.4
-altair==5.1.2
-requests>=2.31.0
-nba_api==1.4.1
+streamlit
+pandas
+numpy
+altair
+requests
+nba_api
