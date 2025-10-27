@@ -4,6 +4,7 @@
 # - Opponent-specific last-5 box scores via LeagueGameFinder (all seasons)
 # - Sidebar: Season, Player search, Recency; auto-load (no button)
 # - NBA-only teams (filters out WNBA/G-League by TEAM_ID prefix)
+# - UPDATED Compare Windows: Career, Previous Season, Current Season, Last 5, Last 20 (MIN, PTS, REB, AST, 3PM)
 
 import time
 import datetime
@@ -54,6 +55,14 @@ def _season_labels(start=2010, end=None):
     return [lab(y) for y in range(end, start-1, -1)]
 
 SEASONS = _season_labels(2015, datetime.datetime.utcnow().year)
+
+def _prev_season_label(season_label: str) -> str:
+    """Turn '2025-26' -> '2024-25' safely."""
+    try:
+        y0 = int(season_label.split("-")[0])
+        return f"{y0-1}-{str((y0)%100).zfill(2)}"
+    except Exception:
+        return season_label
 
 # ----------------------- Utils -----------------------
 def numeric_format_map(df):
@@ -493,35 +502,66 @@ else:
     st.info("No trend data available to chart.")
 
 # ----------------------- Compare Windows -----------------------
-st.markdown("### Compare Windows (Career / Season / L5 / L15)")
+st.markdown("### Compare Windows (Career / Prev Season / Current Season / L5 / L20)")
 
 def avg(df, n):
     if df.empty: return pd.Series(dtype=float)
     if n == "Season": return df.mean(numeric_only=True)
     return df.head(int(n)).mean(numeric_only=True)
 
-def career_per_game(career_df, cols=("PTS","REB","AST","MIN")):
+def career_per_game(career_df, cols=("MIN","PTS","REB","AST","FG3M")):
     if career_df.empty or "GP" not in career_df.columns:
         return pd.Series({c: np.nan for c in cols}, dtype=float)
     needed = list(set(cols) | {"GP"})
     for c in needed:
         if c not in career_df.columns: career_df[c] = 0
-    total_gp = career_df["GP"].sum()
+    total_gp = pd.to_numeric(career_df["GP"], errors="coerce").sum()
     if total_gp == 0:
         return pd.Series({c: np.nan for c in cols}, dtype=float)
-    out = {c: career_df[c].sum() / total_gp for c in cols}
+    out = {c: pd.to_numeric(career_df[c], errors="coerce").sum() / total_gp for c in cols}
     return pd.Series(out).astype(float)
 
-kpi = [c for c in ["PTS","REB","AST","MIN"] if (c in logs.columns) or (c in career_df.columns)]
-career_pg = career_per_game(career_df, cols=kpi)
-vals = {
-    "Career": career_pg,
-    "Season": avg(logs[kpi], "Season") if set(kpi).issubset(logs.columns) else pd.Series({s: np.nan for s in kpi}),
-    "L5": avg(logs[kpi], 5) if set(kpi).issubset(logs.columns) else pd.Series({s: np.nan for s in kpi}),
-    "L15": avg(logs[kpi], 15) if set(kpi).issubset(logs.columns) else pd.Series({s: np.nan for s in kpi}),
-}
-cmp_df = pd.DataFrame(vals).round(2)
-st.dataframe(cmp_df.style.format(numeric_format_map(cmp_df)), use_container_width=True, height=_auto_height(cmp_df))
+# Ensure 3PM column exists in logs for means
+if "FG3M" not in logs.columns:
+    logs["FG3M"] = 0
+
+# Compute each slice
+metrics_order = ["MIN","PTS","REB","AST","FG3M"]
+
+career_pg = career_per_game(career_df, cols=metrics_order)
+
+# Previous season
+prev_season = _prev_season_label(season)
+prev_logs = get_player_logs(player_id, prev_season)
+for col in metrics_order:
+    if col not in prev_logs.columns:
+        prev_logs[col] = 0
+prev_season_pg = prev_logs[metrics_order].mean(numeric_only=True)
+
+# Current season
+for col in metrics_order:
+    if col not in logs.columns:
+        logs[col] = 0
+current_season_pg = logs[metrics_order].mean(numeric_only=True)
+
+# Last 5 and Last 20
+l5_pg = logs[metrics_order].head(5).mean(numeric_only=True)
+l20_pg = logs[metrics_order].head(20).mean(numeric_only=True)
+
+# Build table with requested order and columns
+cmp_df = pd.DataFrame({
+    "Career Avg": career_pg,
+    "Prev Season Avg": prev_season_pg,
+    "Current Season Avg": current_season_pg,
+    "Last 5 Avg": l5_pg,
+    "Last 20 Avg": l20_pg,
+}, index=metrics_order).round(2)
+
+st.dataframe(
+    cmp_df.style.format(numeric_format_map(cmp_df)),
+    use_container_width=True,
+    height=_auto_height(cmp_df)
+)
 
 # ----------------------- Last 5 Games (current season) -----------------------
 st.markdown("### Last 5 Games")
