@@ -1,5 +1,5 @@
 # app.py — NBA Player Scouting Dashboard
-# (Opponent last-5 box scores fixed via historical abbreviation normalization)
+# (Fix: Opponent last-5 box scores via LeagueGameFinder(player_id, vs_team_id))
 
 import time
 import datetime
@@ -8,7 +8,7 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 import re
-from zoneinfo import ZoneInfo  # used for ET cutoff
+from zoneinfo import ZoneInfo  # ET cutoff for season-to-date
 
 from nba_api.stats.static import teams as static_teams
 from nba_api.stats.endpoints import (
@@ -17,6 +17,7 @@ from nba_api.stats.endpoints import (
     leaguedashteamstats,
     LeagueDashPlayerStats,
     commonplayerinfo,
+    leaguegamefinder,  # <-- NEW: use this for vs-opponent game logs
 )
 
 # ----------------------- Streamlit Setup -----------------------
@@ -64,10 +65,9 @@ def _fmt1(v):
     except Exception:
         return "—"
 
-# --- Parsing MATCHUP opponent token ---
+# --- Parsing MATCHUP opponent token (used only in legacy fallback) ---
 _punct_re = re.compile(r"[^\w]")
 def parse_opp_from_matchup(matchup_str: str):
-    # Examples: "BOS vs. LAL", "BOS @ MIA"
     if not isinstance(matchup_str, str):
         return None
     parts = matchup_str.split()
@@ -94,12 +94,11 @@ def format_record(w, l):
     except Exception:
         return "—"
 
-# --- Robust opponent abbrev resolver + HISTORICAL ALIASES ---
+# --- Robust opponent abbrev resolver + minimal aliases (only for fallback path) ---
 def _build_static_maps():
     teams_df = pd.DataFrame(static_teams.get_teams())
     by_full = dict(zip(teams_df["full_name"].astype(str), teams_df["abbreviation"].astype(str)))
 
-    # Modern nicknames/UI names:
     nick_map = {
         "LA Clippers": "LAC", "Los Angeles Clippers": "LAC",
         "LA Lakers": "LAL", "Los Angeles Lakers": "LAL",
@@ -119,33 +118,19 @@ def _build_static_maps():
         "PHI 76ers": "PHI", "Philadelphia 76ers": "PHI",
     }
 
-    # Historical code aliases found in older box scores:
-    alias_map = {
-        "PHO": "PHX",
-        "BRK": "BKN",
-        "NJN": "BKN",
-        "NOH": "NOP",
-        "NOK": "NOP",
-        "CHO": "CHA",
-        "CHH": "CHA",
-        "SEA": "OKC",
-        "WSB": "WAS",
-        "VAN": "MEM",
-        "NOKH": "NOP",  # safety
-        "KCK": "SAC",   # very old
-        "SDC": "LAC",   # San Diego Clippers
-        "GS": "GSW",    # rare two-letter in some data dumps
-        "NY": "NYK",
-        "SA": "SAS",
-        "UTAH": "UTA",
+    alias_map = {  # legacy abbreviations occasionally found in old logs (fallback only)
+        "PHO": "PHX", "BRK": "BKN", "NJN": "BKN", "NOH": "NOP", "NOK": "NOP",
+        "CHO": "CHA", "CHH": "CHA", "SEA": "OKC", "WSB": "WAS", "VAN": "MEM",
     }
 
     by_full_cf = {k.casefold(): v for k, v in by_full.items()}
     nick_cf = {k.casefold(): v for k, v in nick_map.items()}
     alias_up = {k.upper(): v.upper() for k, v in alias_map.items()}
-    return by_full_cf, nick_cf, alias_up
+    # also expose TEAM_ID mapping (for main LeagueGameFinder path)
+    id_by_full = dict(zip(teams_df["full_name"].astype(str), teams_df["id"].astype(int)))
+    return by_full_cf, nick_cf, alias_up, id_by_full
 
-BY_FULL_CF, NICK_CF, ABBR_ALIAS = _build_static_maps()
+BY_FULL_CF, NICK_CF, ABBR_ALIAS, TEAMID_BY_FULL = _build_static_maps()
 
 def normalize_abbr(abbr: str | None) -> str | None:
     if not isinstance(abbr, str) or not abbr:
@@ -154,19 +139,25 @@ def normalize_abbr(abbr: str | None) -> str | None:
     return ABBR_ALIAS.get(a, a)
 
 def resolve_team_abbrev(team_name: str, team_ctx_row: pd.Series | None = None) -> str | None:
-    # 1) Prefer current season row
     if team_ctx_row is not None and "TEAM_ABBREVIATION" in team_ctx_row.index:
         v = str(team_ctx_row.get("TEAM_ABBREVIATION", "")).strip().upper()
         if 2 <= len(v) <= 4:
             return normalize_abbr(v)
-    # 2) Full name map / nickname map
     if isinstance(team_name, str):
         cf = team_name.casefold().strip()
-        if cf in BY_FULL_CF:
-            return normalize_abbr(BY_FULL_CF[cf])
-        if cf in NICK_CF:
-            return normalize_abbr(NICK_CF[cf])
+        if cf in BY_FULL_CF: return normalize_abbr(BY_FULL_CF[cf])
+        if cf in NICK_CF:    return normalize_abbr(NICK_CF[cf])
     return None
+
+def resolve_team_id(team_name: str, team_ctx_row: pd.Series | None = None) -> int | None:
+    # Prefer TEAM_ID from the current team_ctx row (always NBA, current season)
+    if team_ctx_row is not None and "TEAM_ID" in team_ctx_row.index:
+        try:
+            return int(team_ctx_row["TEAM_ID"])
+        except Exception:
+            pass
+    # Fallback to static map by full name
+    return TEAMID_BY_FULL.get(team_name)
 
 # ----------------------- Cached data -----------------------
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
@@ -219,7 +210,7 @@ def get_common_player_info(player_id):
     except Exception:
         return pd.DataFrame()
 
-# --- Team context with 5-min TTL; through today's ET; returns (df, fetched_at, cutoff_et) ---
+# --- Team context (5-min TTL) through today's ET ---
 @st.cache_data(ttl=TEAM_CTX_TTL_SECONDS, show_spinner=False)
 def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _refresh_key: int = 0):
     common_params = {
@@ -283,6 +274,7 @@ def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _r
     fetched_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
     return df, fetched_at, cutoff_date_et
 
+# --- Fallback: collect all-season player logs and filter by parsed matchup token ---
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
 def get_all_player_logs_all_seasons(player_id, season_labels):
     frames = []
@@ -294,6 +286,43 @@ def get_all_player_logs_all_seasons(player_id, season_labels):
         return pd.DataFrame()
     out = pd.concat(frames, axis=0, ignore_index=True)
     return out.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+
+# --- Primary: use LeagueGameFinder to fetch player's games vs a specific opponent across ALL seasons ---
+@st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
+def get_vs_opponent_games(player_id: int, opp_team_id: int):
+    """
+    Reliable per-game box scores vs opponent across all seasons (Regular Season only).
+    """
+    try:
+        frames = _retry_api(
+            leaguegamefinder.LeagueGameFinder,
+            {
+                "player_or_team_abbreviation": "P",   # player mode
+                "player_id_nullable": player_id,
+                "vs_team_id_nullable": opp_team_id,
+                "season_type_nullable": "Regular Season",
+                "league_id_nullable": "00",
+            },
+        )
+        df = frames[0] if frames else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    # Normalize dates and sort newest first
+    if "GAME_DATE" in df.columns:
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
+        df = df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
+
+    # Expected column names from LeagueGameFinder:
+    # 'GAME_DATE','MATCHUP','WL','MIN','PTS','REB','AST','FGM','FGA','FG3M','FG3A','FTM','FTA','OREB','DREB'
+    wanted = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
+    for c in wanted:
+        if c not in df.columns:
+            df[c] = 0
+    return df[wanted]
 
 # ----------------------- Sidebar (Season, Player, Recency + Refresh) -----------------------
 with st.sidebar:
@@ -460,39 +489,42 @@ st.dataframe(last5.style.format(num_fmt), use_container_width=True, height=_auto
 # ----------------------- Last 5 vs Opponent (All Seasons) -----------------------
 st.markdown(f"### Last 5 vs {opponent} (All Seasons)")
 
-# Resolve selected opponent to canonical abbrev and normalize
-opp_abbrev = normalize_abbr(resolve_team_abbrev(opponent, opp_row))
+# Primary: LeagueGameFinder using opponent TEAM_ID (most robust)
+opp_team_id = resolve_team_id(opponent, opp_row)
+vs_opp_df = pd.DataFrame()
+if opp_team_id:
+    vs_opp_df = get_vs_opponent_games(player_id, opp_team_id)
 
-# Seasons list from player's career (preferred), else fallback
-if "SEASON" in career_df.columns and not career_df.empty:
-    season_labels = list(career_df["SEASON"].dropna().unique())
-    def _yr(s):
-        try: return int(s.split("-")[0])
-        except: return -1
-    season_labels = sorted(season_labels, key=_yr, reverse=True)
-else:
-    season_labels = SEASONS
-
-if opp_abbrev:
-    all_logs = get_all_player_logs_all_seasons(player_id, season_labels)
-    if all_logs.empty or "MATCHUP" not in all_logs.columns:
-        st.info(f"No matchup data available for {opponent}.")
+# Fallback: if nothing returned (rare), use all-season logs + parsed MATCHUP token
+if vs_opp_df.empty:
+    # Resolve abbrev for fallback filter
+    opp_abbrev = resolve_team_abbrev(opponent, opp_row)
+    # Seasons list from player's career (preferred), else fallback
+    if "SEASON" in career_df.columns and not career_df.empty:
+        season_labels = list(career_df["SEASON"].dropna().unique())
+        def _yr(s):
+            try: return int(s.split("-")[0])
+            except: return -1
+        season_labels = sorted(season_labels, key=_yr, reverse=True)
     else:
-        all_logs = all_logs.copy()
-        # Parse opponent token from MATCHUP and normalize via alias map
-        all_logs["OPP_ABBR_RAW"] = all_logs["MATCHUP"].apply(parse_opp_from_matchup)
-        all_logs["OPP_ABBR"] = all_logs["OPP_ABBR_RAW"].apply(normalize_abbr)
-        # Match on canonical codes (handles PHO/NJN/NOH/CHO/etc.)
-        vs_opp_all = all_logs[all_logs["OPP_ABBR"] == opp_abbrev]
-        vs_opp5 = vs_opp_all[cols_base].head(5).copy() if not vs_opp_all.empty else pd.DataFrame(columns=cols_base)
-        vs_opp5 = add_shot_breakouts(vs_opp5)
-        if vs_opp5.empty:
-            st.info(f"No historical games vs {opponent}.")
-        else:
-            num_fmt2 = {c: "{:.0f}" for c in vs_opp5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
-            st.dataframe(vs_opp5.style.format(num_fmt2), use_container_width=True, height=_auto_height(vs_opp5))
+        season_labels = SEASONS
+
+    if opp_abbrev:
+        all_logs = get_all_player_logs_all_seasons(player_id, season_labels)
+        if not all_logs.empty and "MATCHUP" in all_logs.columns:
+            all_logs = all_logs.copy()
+            all_logs["OPP_ABBR"] = all_logs["MATCHUP"].apply(parse_opp_from_matchup)
+            # (light aliasing for safety)
+            all_logs["OPP_ABBR"] = all_logs["OPP_ABBR"].apply(lambda x: ABBR_ALIAS.get(x, x) if isinstance(x, str) else x)
+            vs_opp_df = all_logs[all_logs["OPP_ABBR"] == opp_abbrev][cols_base].copy() if opp_abbrev else pd.DataFrame(columns=cols_base)
+
+# Render last 5 vs opponent (if any)
+if vs_opp_df.empty:
+    st.info(f"No historical games vs {opponent}.")
 else:
-    st.info("Could not resolve opponent abbreviation; skipping opponent-specific table.")
+    vs_opp5 = add_shot_breakouts(vs_opp_df.sort_values("GAME_DATE", ascending=False).head(5).copy())
+    num_fmt2 = {c: "{:.0f}" for c in vs_opp5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
+    st.dataframe(vs_opp5.style.format(num_fmt2), use_container_width=True, height=_auto_height(vs_opp5))
 
 # ----------------------- Projections (hidden) -----------------------
 with st.expander("Projection Summary (beta – hidden until finalized)"):
@@ -514,4 +546,4 @@ with st.expander("Projection Summary (beta – hidden until finalized)"):
             st.info(f"Projection temporarily unavailable: {e}")
 
 # ----------------------- Footer -----------------------
-st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). Opponent last-5 uses historical abbreviation normalization (e.g., PHO→PHX, NJN/BRK→BKN, NOH/NOK→NOP, CHO/CHH→CHA, SEA→OKC).")
+st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). Opponent last-5 uses LeagueGameFinder(player_id, vs_team_id), with legacy parsing as fallback.")
