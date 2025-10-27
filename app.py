@@ -29,7 +29,7 @@ from nba_api.stats.endpoints import (
 
 # ----------------------- Streamlit Setup -----------------------
 st.set_page_config(page_title="NBA Player Scouting Dashboard", layout="wide")
-st.title("🏀 NBA Player Scouting Dashboard")
+st.title("NBA Player Scouting Dashboard")
 
 # ----------------------- Config -----------------------
 CACHE_HOURS = 12           # general caches
