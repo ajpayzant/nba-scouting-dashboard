@@ -637,7 +637,7 @@ else:
     st.dataframe(vs_opp5.style.format(num_fmt2), use_container_width=True, height=_auto_height(vs_opp5))
 
 # ----------------------- Projections (narrower CI + minutes volatility weighting) -----------------------
-with st.expander("Projection Summary (beta – improved CI)"):
+with st.expander("Player Projection Summary"):
     st.caption("Blend of Recent/Season/Prev Season/Career and (if available) vs-Opponent, with defense & pace adjustments, scaled to projected minutes. Confidence bands use robust stats + minutes volatility.")
     try:
         # -------- Config knobs (light UI, isolated) --------
