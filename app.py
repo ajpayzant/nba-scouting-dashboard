@@ -656,7 +656,7 @@ with st.expander("Projection Summary (beta – improved CI)"):
         # CI controls (narrower by default)
         cc4, cc5, cc6 = st.columns(3)
         with cc4:
-            z_level = st.selectbox("CI Level", ["80%","70%","90%"], index=0)  # default 80%
+            z_level = st.selectbox("CI Level", ["90%", "80%","70%"], index=0)  # default 80%
             z_map = {"70%":1.04, "80%":1.28, "90%":1.64}
             z = z_map[z_level]
         with cc5:
