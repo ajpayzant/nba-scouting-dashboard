@@ -1,5 +1,9 @@
-# app.py — NBA Player Scouting Dashboard
-# (Fix: Opponent last-5 box scores via LeagueGameFinder(player_id, vs_team_id))
+# app.py — NBA Player Scouting Dashboard (2025-10-27)
+# - Opponent advanced metrics: Advanced=PerGame, Base=Totals (MIN matches NBA.com)
+# - Season-to-date through today's ET (short TTL + manual refresh/clear)
+# - Opponent-specific last-5 box scores via LeagueGameFinder (all seasons)
+# - Sidebar: Season, Player search, Recency; auto-load (no button)
+# - NBA-only teams (filters out WNBA/G-League by TEAM_ID prefix)
 
 import time
 import datetime
@@ -17,7 +21,8 @@ from nba_api.stats.endpoints import (
     leaguedashteamstats,
     LeagueDashPlayerStats,
     commonplayerinfo,
-    leaguegamefinder,  # <-- NEW: use this for vs-opponent game logs
+    leaguegamefinder,                # for opponent-specific all-season logs
+    teamdashboardbygeneralsplits,    # for per-team fallback diagnostics
 )
 
 # ----------------------- Streamlit Setup -----------------------
@@ -25,8 +30,8 @@ st.set_page_config(page_title="NBA Player Scouting Dashboard", layout="wide")
 st.title("🏀 NBA Player Scouting Dashboard")
 
 # ----------------------- Config -----------------------
-CACHE_HOURS = 12                      # general caches
-TEAM_CTX_TTL_SECONDS = 300            # 5 min TTL for opponent metrics
+CACHE_HOURS = 12           # general caches
+TEAM_CTX_TTL_SECONDS = 300 # 5 min TTL for opponent metrics
 REQUEST_TIMEOUT = 15
 MAX_RETRIES = 2
 
@@ -94,10 +99,11 @@ def format_record(w, l):
     except Exception:
         return "—"
 
-# --- Robust opponent abbrev resolver + minimal aliases (only for fallback path) ---
+# --- Opponent abbrev & TEAM_ID resolution (for fallback and GameFinder) ---
 def _build_static_maps():
     teams_df = pd.DataFrame(static_teams.get_teams())
     by_full = dict(zip(teams_df["full_name"].astype(str), teams_df["abbreviation"].astype(str)))
+    id_by_full = dict(zip(teams_df["full_name"].astype(str), teams_df["id"].astype(int)))
 
     nick_map = {
         "LA Clippers": "LAC", "Los Angeles Clippers": "LAC",
@@ -117,17 +123,11 @@ def _build_static_maps():
         "BRK Nets": "BKN", "Brooklyn Nets": "BKN",
         "PHI 76ers": "PHI", "Philadelphia 76ers": "PHI",
     }
-
-    alias_map = {  # legacy abbreviations occasionally found in old logs (fallback only)
-        "PHO": "PHX", "BRK": "BKN", "NJN": "BKN", "NOH": "NOP", "NOK": "NOP",
-        "CHO": "CHA", "CHH": "CHA", "SEA": "OKC", "WSB": "WAS", "VAN": "MEM",
-    }
+    alias_map = {"PHO":"PHX","BRK":"BKN","NJN":"BKN","NOH":"NOP","NOK":"NOP","CHO":"CHA","CHH":"CHA","SEA":"OKC","WSB":"WAS","VAN":"MEM"}
 
     by_full_cf = {k.casefold(): v for k, v in by_full.items()}
     nick_cf = {k.casefold(): v for k, v in nick_map.items()}
     alias_up = {k.upper(): v.upper() for k, v in alias_map.items()}
-    # also expose TEAM_ID mapping (for main LeagueGameFinder path)
-    id_by_full = dict(zip(teams_df["full_name"].astype(str), teams_df["id"].astype(int)))
     return by_full_cf, nick_cf, alias_up, id_by_full
 
 BY_FULL_CF, NICK_CF, ABBR_ALIAS, TEAMID_BY_FULL = _build_static_maps()
@@ -150,13 +150,11 @@ def resolve_team_abbrev(team_name: str, team_ctx_row: pd.Series | None = None) -
     return None
 
 def resolve_team_id(team_name: str, team_ctx_row: pd.Series | None = None) -> int | None:
-    # Prefer TEAM_ID from the current team_ctx row (always NBA, current season)
     if team_ctx_row is not None and "TEAM_ID" in team_ctx_row.index:
         try:
             return int(team_ctx_row["TEAM_ID"])
         except Exception:
             pass
-    # Fallback to static map by full name
     return TEAMID_BY_FULL.get(team_name)
 
 # ----------------------- Cached data -----------------------
@@ -210,69 +208,119 @@ def get_common_player_info(player_id):
     except Exception:
         return pd.DataFrame()
 
-# --- Team context (5-min TTL) through today's ET ---
+# ----------------------- Team context (Advanced=PerGame, Base=Totals) -----------------------
 @st.cache_data(ttl=TEAM_CTX_TTL_SECONDS, show_spinner=False)
 def get_team_context_regular_season_to_date(season: str, cutoff_date_et: str, _refresh_key: int = 0):
-    common_params = {
-        "season": season,
-        "season_type_all_star": "Regular Season",
-        "per_mode_detailed": "PerGame",
-        "league_id_nullable": "00",
-        "date_from_nullable": None,
-        "date_to_nullable": cutoff_date_et,  # to date (ET)
-        "po_round_nullable": None,
-    }
-    # Advanced
-    try:
-        adv_frames = _retry_api(
-            leaguedashteamstats.LeagueDashTeamStats,
-            dict(common_params, measure_type_detailed_defense="Advanced"),
-        )
-        df_adv = adv_frames[0] if adv_frames else pd.DataFrame()
-    except Exception:
-        df_adv = pd.DataFrame()
-    # Base (W/L/GP)
-    try:
-        base_frames = _retry_api(
-            leaguedashteamstats.LeagueDashTeamStats,
-            dict(common_params, measure_type_detailed_defense="Base"),
-        )
-        df_base = base_frames[0] if base_frames else pd.DataFrame()
-    except Exception:
-        df_base = pd.DataFrame()
+    """
+    NBA-only team context THROUGH cutoff_date_et (ET).
+    Advanced = PerGame (PACE/ratings), Base = Totals (MIN matches NBA.com).
+    """
+    common = dict(
+        season=season,
+        season_type_all_star="Regular Season",
+        league_id_nullable="00",
+        date_from_nullable=None,
+        date_to_nullable=cutoff_date_et,
+        po_round_nullable=None,
+    )
 
-    if df_adv.empty and df_base.empty:
-        return pd.DataFrame(), datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"), cutoff_date_et
+    def _safe_frames(ep_cls, kwargs):
+        try:
+            frames = _retry_api(ep_cls, kwargs)
+            return frames[0] if frames else pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
 
-    # NBA-only BEFORE merge
-    if not df_adv.empty and "TEAM_ID" in df_adv.columns:
-        df_adv = df_adv[df_adv["TEAM_ID"].astype(str).str.startswith("161061")].copy()
-    if not df_base.empty and "TEAM_ID" in df_base.columns:
-        df_base = df_base[df_base["TEAM_ID"].astype(str).str.startswith("161061")].copy()
+    # Advanced (PerGame)
+    adv = _safe_frames(
+        leaguedashteamstats.LeagueDashTeamStats,
+        dict(common, measure_type_detailed_defense="Advanced", per_mode_detailed="PerGame"),
+    )
+    # Base (Totals) so MIN matches NBA.com (48 * GP)
+    base = _safe_frames(
+        leaguedashteamstats.LeagueDashTeamStats,
+        dict(common, measure_type_detailed_defense="Base", per_mode_detailed="Totals"),
+    )
 
-    # Align & merge
-    cols_adv = ["TEAM_ID","TEAM_NAME","TEAM_ABBREVIATION","PACE","OFF_RATING","DEF_RATING","NET_RATING"]
-    for c in cols_adv:
-        if c not in df_adv.columns: df_adv[c] = np.nan
-    df_adv = df_adv[cols_adv].copy()
+    def _nba_only(df):
+        if df is None or df.empty or "TEAM_ID" not in df.columns:
+            return pd.DataFrame()
+        return df[df["TEAM_ID"].astype(str).str.startswith("161061")].copy()
 
-    cols_base = ["TEAM_ID","GP","W","L","W_PCT","MIN"]
-    for c in cols_base:
-        if c not in df_base.columns: df_base[c] = np.nan
-    df_base = df_base[cols_base].copy()
+    adv = _nba_only(adv)
+    base = _nba_only(base)
 
-    df = pd.merge(df_adv, df_base, on="TEAM_ID", how="inner")
+    # De-dup just in case
+    for df in (adv, base):
+        if not df.empty:
+            df.sort_values(["TEAM_ID"], inplace=True)
+            df.drop_duplicates(subset=["TEAM_ID"], keep="first", inplace=True)
+
+    # Keep cols
+    adv_cols = ["TEAM_ID","TEAM_NAME","TEAM_ABBREVIATION","PACE","OFF_RATING","DEF_RATING","NET_RATING"]
+    for c in adv_cols:
+        if c not in adv.columns: adv[c] = np.nan
+    adv = adv[adv_cols].copy()
+
+    base_cols = ["TEAM_ID","GP","W","L","W_PCT","MIN"]  # MIN totals
+    for c in base_cols:
+        if c not in base.columns: base[c] = np.nan
+    base = base[base_cols].copy()
+
+    # Type coercion
+    for c in ["PACE","OFF_RATING","DEF_RATING","NET_RATING"]:
+        adv[c] = pd.to_numeric(adv[c], errors="coerce")
+    for c in ["GP","W","L","W_PCT","MIN"]:
+        base[c] = pd.to_numeric(base[c], errors="coerce")
+
+    # Merge
+    df = pd.merge(adv, base, on="TEAM_ID", how="inner")
+
+    # Fill missing abbreviations from static teams (rare)
+    teams_df = pd.DataFrame(static_teams.get_teams())
+    abbr_map = dict(zip(teams_df["id"], teams_df["abbreviation"]))
+    df["TEAM_ABBREVIATION"] = df["TEAM_ABBREVIATION"].fillna(df["TEAM_ID"].map(abbr_map))
+
+    # Validate suspicious rows; fallback to team dashboard if needed
+    def _fix_row(r):
+        bad_def = pd.isna(r["DEF_RATING"]) or not (90 <= float(r["DEF_RATING"]) <= 130)
+        bad_pace = pd.isna(r["PACE"]) or not (90 <= float(r["PACE"]) <= 110)
+        if not (bad_def or bad_pace):
+            return r
+        try:
+            td = _retry_api(
+                teamdashboardbygeneralsplits.TeamDashboardByGeneralSplits,
+                dict(
+                    team_id=int(r["TEAM_ID"]),
+                    season=season,
+                    season_type_all_star="Regular Season",
+                    league_id_nullable="00",
+                    date_from_nullable=None,
+                    date_to_nullable=cutoff_date_et,
+                    measure_type_detailed_defense="Advanced",
+                    per_mode_detailed="PerGame",
+                ),
+            )
+            dash = td[0] if td else pd.DataFrame()
+            if not dash.empty:
+                for k in ["OFF_RATING","DEF_RATING","NET_RATING","PACE","GP","W","L","W_PCT"]:
+                    if k in dash.columns:
+                        r[k] = pd.to_numeric(dash.iloc[0][k], errors="coerce")
+        except Exception:
+            pass
+        return r
+
+    if not df.empty:
+        df = df.apply(_fix_row, axis=1)
 
     # Ranks (1 = best)
-    df["DEF_RANK"] = df["DEF_RATING"].rank(ascending=True,  method="min")
-    df["PACE_RANK"] = df["PACE"].rank(ascending=False, method="min")
-    df["NET_RANK"]  = df["NET_RATING"].rank(ascending=False, method="min")
-    for c in ["DEF_RANK","PACE_RANK","NET_RANK"]:
-        df[c] = df[c].astype("Int64")
+    df["DEF_RANK"] = df["DEF_RATING"].rank(ascending=True,  method="min").astype("Int64")
+    df["PACE_RANK"] = df["PACE"].rank(ascending=False, method="min").astype("Int64")
+    df["NET_RANK"]  = df["NET_RATING"].rank(ascending=False, method="min").astype("Int64")
 
-    df = df.sort_values("TEAM_NAME").reset_index(drop=True)
+    df.sort_values("TEAM_NAME", inplace=True)
     fetched_at = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    return df, fetched_at, cutoff_date_et
+    return df.reset_index(drop=True), fetched_at, cutoff_date_et
 
 # --- Fallback: collect all-season player logs and filter by parsed matchup token ---
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
@@ -311,13 +359,10 @@ def get_vs_opponent_games(player_id: int, opp_team_id: int):
     if df.empty:
         return df
 
-    # Normalize dates and sort newest first
     if "GAME_DATE" in df.columns:
         df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
         df = df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
 
-    # Expected column names from LeagueGameFinder:
-    # 'GAME_DATE','MATCHUP','WL','MIN','PTS','REB','AST','FGM','FGA','FG3M','FG3A','FTM','FTA','OREB','DREB'
     wanted = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
     for c in wanted:
         if c not in df.columns:
@@ -497,9 +542,7 @@ if opp_team_id:
 
 # Fallback: if nothing returned (rare), use all-season logs + parsed MATCHUP token
 if vs_opp_df.empty:
-    # Resolve abbrev for fallback filter
     opp_abbrev = resolve_team_abbrev(opponent, opp_row)
-    # Seasons list from player's career (preferred), else fallback
     if "SEASON" in career_df.columns and not career_df.empty:
         season_labels = list(career_df["SEASON"].dropna().unique())
         def _yr(s):
@@ -514,7 +557,7 @@ if vs_opp_df.empty:
         if not all_logs.empty and "MATCHUP" in all_logs.columns:
             all_logs = all_logs.copy()
             all_logs["OPP_ABBR"] = all_logs["MATCHUP"].apply(parse_opp_from_matchup)
-            # (light aliasing for safety)
+            # light aliasing for safety
             all_logs["OPP_ABBR"] = all_logs["OPP_ABBR"].apply(lambda x: ABBR_ALIAS.get(x, x) if isinstance(x, str) else x)
             vs_opp_df = all_logs[all_logs["OPP_ABBR"] == opp_abbrev][cols_base].copy() if opp_abbrev else pd.DataFrame(columns=cols_base)
 
@@ -546,4 +589,4 @@ with st.expander("Projection Summary (beta – hidden until finalized)"):
             st.info(f"Projection temporarily unavailable: {e}")
 
 # ----------------------- Footer -----------------------
-st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). Opponent last-5 uses LeagueGameFinder(player_id, vs_team_id), with legacy parsing as fallback.")
+st.caption("Notes: Opponent metrics are NBA-only ‘Regular Season’ through today’s ET date (5-min cache). MIN reflects totals from Base (Totals); PACE/ratings from Advanced (PerGame). Opponent last-5 uses LeagueGameFinder with a robust fallback.")
