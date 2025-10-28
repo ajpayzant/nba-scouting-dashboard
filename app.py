@@ -207,56 +207,22 @@ def get_season_player_index(season):
         if c not in df.columns: df[c] = 0
     return df[keep].drop_duplicates(subset=["PLAYER_ID"]).sort_values(["TEAM_NAME","PLAYER_NAME"]).reset_index(drop=True)
 
-@st.cache_data(ttl=CACHE_HOURS*3600)
+@st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
 def get_player_logs(player_id, season):
-    """
-    Robust pull of regular-season logs only.
-    - Forces season_type to 'Regular Season'
-    - Normalizes dates
-    - De-dupes by GAME_ID stably (keep latest row if the API ever duplicates)
-    - Sorts strictly by GAME_DATE desc, then by GAME_ID desc as tiebreaker
-    """
     try:
-        df = playergamelog.PlayerGameLog(
-            player_id=player_id,
-            season=season,
-            season_type_all_star="Regular Season"  # force reg season only
-        ).get_data_frames()[0]
+        frames = _retry_api(playergamelog.PlayerGameLog, {
+            "player_id": player_id,
+            "season": season,
+            "season_type_all_star": "Regular Season",
+            "league_id_nullable": "00",
+        })
+        df = frames[0] if frames else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
-
-    if df.empty:
-        return df
-
-    # Normalize types
+    if df.empty: return df
     if "GAME_DATE" in df.columns:
         df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
-    else:
-        df["GAME_DATE"] = pd.NaT
-
-    # Some environments return GAME_ID as int or string; normalize to string
-    if "GAME_ID" in df.columns:
-        df["GAME_ID"] = df["GAME_ID"].astype(str)
-    else:
-        df["GAME_ID"] = ""
-
-    # Dedupe by GAME_ID just in case API returns duplicates
-    df = df.sort_values(["GAME_DATE", "GAME_ID"], ascending=[False, False]).drop_duplicates(
-        subset=["GAME_ID"], keep="first"
-    )
-
-    # Helpful derived cols
-    for col in ["PTS","REB","AST","FG3M","FG3A","FTM","FTA","OREB","DREB","MIN","FGA","FGM","TOV"]:
-        if col not in df.columns:
-            df[col] = 0
-    # PRA
-    df["PRA"] = pd.to_numeric(df["PTS"], errors="coerce").fillna(0) + \
-                pd.to_numeric(df["REB"], errors="coerce").fillna(0) + \
-                pd.to_numeric(df["AST"], errors="coerce").fillna(0)
-
-    # Final sort (most recent first)
-    df = df.sort_values(["GAME_DATE", "GAME_ID"], ascending=[False, False]).reset_index(drop=True)
-    return df
+    return df.sort_values("GAME_DATE", ascending=False).reset_index(drop=True)
 
 @st.cache_data(ttl=CACHE_HOURS*3600, show_spinner=False)
 def get_player_career(player_id):
@@ -620,10 +586,15 @@ st.dataframe(
     height=_auto_height(cmp_df)
 )
 
-# ----------------------- Last 5 Games -----------------------
-st.markdown("### Last 5 Games (Regular Season)")
-cols = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","PRA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
-last5 = logs.loc[:, [c for c in cols if c in logs.columns]].head(5).copy()
+# ----------------------- Last 5 Games (current season) -----------------------
+st.markdown("### Last 5 Games")
+cols_base = ["GAME_DATE","MATCHUP","WL","MIN","PTS","REB","AST","FGM","FGA","FG3M","FG3A","FTM","FTA","OREB","DREB"]
+last5 = logs[cols_base].head(5).copy()
+last5 = add_shot_breakouts(last5)
+# Append average row
+last5 = append_average_row(last5, label="Average (Last 5)")
+num_fmt = {c: "{:.1f}" for c in last5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
+st.dataframe(last5.style.format(num_fmt), use_container_width=True, height=_auto_height(last5))
 
 # Average row (exactly over these 5)
 if not last5.empty:
