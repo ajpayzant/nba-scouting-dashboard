@@ -596,19 +596,6 @@ last5 = append_average_row(last5, label="Average (Last 5)")
 num_fmt = {c: "{:.1f}" for c in last5.select_dtypes(include=[np.number]).columns if c != "GAME_DATE"}
 st.dataframe(last5.style.format(num_fmt), use_container_width=True, height=_auto_height(last5))
 
-# Average row (exactly over these 5)
-if not last5.empty:
-    avg_row = last5.select_dtypes(include=[np.number]).mean(numeric_only=True)
-    avg_row = avg_row.reindex(last5.columns, fill_value="")
-    avg_row["GAME_DATE"] = "Average (Last 5)"
-    last5 = pd.concat([last5, pd.DataFrame([avg_row])], ignore_index=True)
-
-st.dataframe(
-    last5.style.format({c: "{:.0f}" for c in last5.select_dtypes(include=[np.number]).columns}),
-    use_container_width=True,
-    height=min(420, 70 + 34*len(last5))
-)
-
 # ----------------------- Last 5 vs Opponent (All Seasons) -----------------------
 st.markdown(f"### Last 5 vs {opponent} (All Seasons)")
 
