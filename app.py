@@ -597,7 +597,7 @@ num_fmt = {c: "{:.1f}" for c in last5.select_dtypes(include=[np.number]).columns
 st.dataframe(last5.style.format(num_fmt), use_container_width=True, height=_auto_height(last5))
 
 # ----------------------- Last 5 vs Opponent (All Seasons) -----------------------
-st.markdown(f"### Last 5 vs {opponent} (All Seasons)")
+st.markdown(f"### Last 5 vs {opponent}")
 
 # Primary: LeagueGameFinder using opponent TEAM_ID (most robust)
 opp_team_id = resolve_team_id(opponent, opp_row)
